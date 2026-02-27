@@ -1,10 +1,11 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
+using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using REPO_Active.Runtime;
@@ -18,18 +19,7 @@ namespace REPO_Active
     {
         public const string PluginGuid = "angelcomilk.repo_active";
         public const string PluginName = "REPO_Active";
-        public const string PluginVersion = "4.6.3";
-
-        // Verification notes (decompile cross-check):
-        // - ExtractionPoint.OnClick(), ExtractionPoint.currentState -> VERIFIED in Assembly-CSharp\ExtractionPoint.cs.
-        // - Photon.Pun.PhotonNetwork.InRoom / IsMasterClient / PlayerList -> VERIFIED in PhotonUnityNetworking\PhotonNetwork.cs.
-        // - Photon.Pun.PhotonView.OwnerActorNr -> VERIFIED in PhotonUnityNetworking\PhotonView.cs.
-        // - UnityEngine types verified in decompile output:
-        //   Time/Vector3/Camera/GameObject/Object/MonoBehaviour are in UnityEngine.CoreModule.
-        //   Input is in UnityEngine.InputLegacyModule.
-        //   SceneManager is in UnityEngine.CoreModule (UnityEngine.SceneManagement namespace).
-        // - BepInEx types verified in decompile output:
-        //   BaseUnityPlugin is in BepInEx\BaseUnityPlugin.cs; ConfigFile/ConfigEntry exist in BepInEx\Configuration\*.
+        public const string PluginVersion = "5.1.0";
 
         // ---- config ----
         private ConfigEntry<bool> _autoActivate = null!;
@@ -40,6 +30,8 @@ namespace REPO_Active
         private ExtractionPointScanner _scanner = null!;
         private ExtractionPointInvoker _invoker = null!;
         private ModLogger? _dbg;
+        private Harmony? _harmony;
+        private static Plugin? _instance;
 
         private float _autoTimer = 0f;
         private float _discoverTimer = 0f;
@@ -56,7 +48,6 @@ namespace REPO_Active
         private int _playerListEmptyStreak = 0;
         private int _lastPlayerCount = -1;
         private float _lastBaseInterval = DISCOVER_INTERVAL_BASE;
-        private bool _lastAnyMoved = false;
         private int _lastHostPosCount = -1;
         private string _lastDiscoverReason = "";
         private int _lastDiscoverAll = -1;
@@ -66,6 +57,7 @@ namespace REPO_Active
         private string _lastBusyInfo = "";
         private int _lastBusyCount = -1;
         private float _lastBusyLogTime = -1f;
+        private bool? _lastTailHoldState = null;
 
         private const float RESCAN_COOLDOWN = 0.6f;
         private const bool SKIP_ACTIVATED = true;
@@ -77,7 +69,6 @@ namespace REPO_Active
         private const float DISCOVER_INTERVAL_MAX = 3.0f;
         private const float DISCOVER_RADIUS = 20f;
         private const float AUTO_READY_BUFFER = 30f;
-        private const float PLAYER_MOVE_THRESHOLD = 1.0f;
 
         private void Awake()
         {
@@ -91,6 +82,9 @@ namespace REPO_Active
             _dbg = new ModLogger(Logger, _enableDebugLog.Value);
             _scanner.DebugLog = _dbg.Log;
 
+            _instance = this;
+            InstallEventPatches();
+
             SceneManager.sceneLoaded += OnSceneLoaded;
             Logger.LogInfo($"{PluginName} {PluginVersion} loaded. (OnClick reflection activation)");
             _dbg.Log($"[INIT] {PluginName} {PluginVersion} Auto={_autoActivate.Value} DiscoverAll={_discoverAllPoints.Value}");
@@ -99,7 +93,10 @@ namespace REPO_Active
         private void OnDestroy()
         {
             try { SceneManager.sceneLoaded -= OnSceneLoaded; } catch { }
+            try { UninstallEventPatches(); } catch { }
+            if (ReferenceEquals(_instance, this)) _instance = null;
         }
+
 
         private void Update()
         {
@@ -110,8 +107,15 @@ namespace REPO_Active
             // [VERIFY] UnityEngine.Input.GetKeyDown (UnityEngine.InputLegacyModule).
             if (Input.GetKeyDown(_keyActivateNearest.Value))
             {
-                _dbg?.Log("[INPUT] F3 pressed");
-                ActivateNearest();
+                if (_autoActivate.Value)
+                {
+                    _dbg?.Log("[INPUT] F3 ignored (auto mode enabled)");
+                }
+                else
+                {
+                    _dbg?.Log("[INPUT] F3 pressed");
+                    ActivateNearest();
+                }
             }
 
 
@@ -192,10 +196,12 @@ namespace REPO_Active
             _autoPrimed = false;
             _autoTimer = 0f;
             _discoverTimer = 0f;
+            _lastTailHoldState = null;
             _scanner.ResetForNewRound();
             _logReady = false;
             _lastPlayerCount = -1;
             _lastBaseInterval = DISCOVER_INTERVAL_BASE;
+            RefreshDiscoveryIntervalFromCurrentPlayerCount("scene init", invalidateCache: true);
             _dbg?.Log("[SCENE] new scene loaded, reset timers");
         }
 
@@ -246,25 +252,32 @@ namespace REPO_Active
                     LogDiscoverState("skip: all discovered", all.Count, _scanner.DiscoveredCount);
                     return;
                 }
-
-                bool anyMoved;
-                var allPos = TryGetAllPlayerPositionsHost(out anyMoved);
-                _lastAnyMoved = anyMoved;
+                var allPos = TryGetAllPlayerPositionsHost();
+                var spawnPos = _scanner.GetSpawnPos();
                 if (allPos.Count == 0)
                 {
                     _playerListEmptyStreak++;
-                    LogDiscoverState("skip: PlayerList not ready", all.Count, _scanner.DiscoveredCount);
-                    return;
+                    LogDiscoverState("fallback: PlayerList not ready -> local", all.Count, _scanner.DiscoveredCount);
+
+                    var newlyLocal = new List<Component>();
+                    int addedLocal = _scanner.UpdateDiscoveredDetailed(refPos, DISCOVER_RADIUS, newlyLocal);
+                    if (addedLocal > 0 && _dbg != null)
+                    {
+                        _dbg.Log($"[DISCOVER] by local pos={refPos} +{addedLocal}");
+                        for (int j = 0; j < newlyLocal.Count; j++)
+                        {
+                            var ep = newlyLocal[j];
+                            if (!ep) continue;
+                            var epPos = ep.transform.position;
+                            var dp = Vector3.Distance(refPos, epPos);
+                            string ds = spawnPos == Vector3.zero ? "na" : Vector3.Distance(spawnPos, epPos).ToString("0.00");
+                            _dbg.Log($"[DISCOVER+] ep={ep.gameObject.name} epPos={epPos} distToPlayer={dp:0.00} distToSpawn={ds}");
+                        }
+                    }
                 }
                 else
                 {
                     _playerListEmptyStreak = 0;
-                    if (!anyMoved)
-                    {
-                        LogDiscoverState("skip: no movement", all.Count, _scanner.DiscoveredCount);
-                        return;
-                    }
-                    var spawnPos = _scanner.GetSpawnPos();
                     for (int i = 0; i < allPos.Count; i++)
                     {
                         var newly = new List<Component>();
@@ -351,7 +364,57 @@ namespace REPO_Active
             _dbg?.Log($"[F3] eligible={eligible.Count} discoverAll={_discoverAllPoints.Value}");
 
             // 4) 构建规划列表
-            var plan = _scanner.BuildStage1PlannedList(eligible, spawnPos, startPos, skipActivated: SKIP_ACTIVATED);
+            var planInput = eligible;
+            if (!_discoverAllPoints.Value
+                && eligible.Count > 1
+                && _scanner.TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out _, out var globalTail)
+                && globalTail != null)
+            {
+                int tailId = globalTail.GetInstanceID();
+                bool hasTail = false;
+                for (int i = 0; i < eligible.Count; i++)
+                {
+                    if (eligible[i] && eligible[i].GetInstanceID() == tailId)
+                    {
+                        hasTail = true;
+                        break;
+                    }
+                }
+
+                if (hasTail)
+                {
+                    var filtered = new List<Component>();
+                    int unfinishedNonTail = 0;
+                    for (int i = 0; i < eligible.Count; i++)
+                    {
+                        var ep = eligible[i];
+                        if (!ep) continue;
+                        if (ep.GetInstanceID() == tailId) continue;
+
+                        filtered.Add(ep);
+
+                        var st = _scanner.ReadStateName(ep);
+                        if (!ExtractionPointScanner.IsCompletedLikeState(st))
+                            unfinishedNonTail++;
+                    }
+
+                    // Only filter out tail when there is at least one unfinished non-tail point.
+                    // If all non-tail points are completed, tail must be allowed into the plan.
+                    if (filtered.Count > 0 && unfinishedNonTail > 0)
+                    {
+                        planInput = filtered;
+                        _dbg?.Log($"[PLAN][TAIL-FILTER] removed global tail from candidates tail={FormatEpShort(globalTail)} input={eligible.Count} filtered={filtered.Count} unfinishedNonTail={unfinishedNonTail}");
+                    }
+                    else if (filtered.Count > 0)
+                    {
+                        _dbg?.Log($"[PLAN][TAIL-FILTER] skipped (all non-tail completed) tail={FormatEpShort(globalTail)} input={eligible.Count} filtered={filtered.Count}");
+                    }
+                }
+            }
+
+            var plan = _discoverAllPoints.Value
+                ? _scanner.BuildPlanDiscoverAllFixedAnchors(allPoints, spawnPos, skipActivated: SKIP_ACTIVATED)
+                : _scanner.BuildStage1PlannedList(planInput, spawnPos, skipActivated: SKIP_ACTIVATED);
             if (plan.Count == 0)
             {
                 Logger.LogWarning("没有可激活的提取点（可能都已激活或未发现）");
@@ -359,14 +422,22 @@ namespace REPO_Active
                 return;
             }
 
+            if (!_discoverAllPoints.Value)
+                LogDiscoveredPlanSummary(plan, allPoints, spawnPos);
+
             var next = plan[0];
+            if (ShouldHoldTailPointActivation(allPoints, spawnPos, plan, next, out var tailBlockReason))
+            {
+                _dbg?.Log($"[F3] tail-lock blocked next={FormatEpShort(next)} reason={tailBlockReason}");
+                return;
+            }
+
             var nextState = _scanner.ReadStateName(next);
             _dbg?.Log($"[F3] next={next.gameObject.name} state={nextState}");
             var distP = Vector3.Distance(startPos, next.transform.position);
             var distS = spawnPos == Vector3.zero ? "na" : Vector3.Distance(spawnPos, next.transform.position).ToString("0.00");
             _dbg?.Log($"[ACTIVATE] ep={next.gameObject.name} epPos={next.transform.position} distToPlayer={distP:0.00} distToSpawn={distS} state={nextState}");
 
-            // 5) 激活方式不改：仍走 OnClick invoker
             Logger.LogInfo($"[F3] Activate planned EP: {next.gameObject.name} pos={next.transform.position} dist={Vector3.Distance(startPos, next.transform.position):0.00}");
 
             var invokeOk = _invoker.InvokeOnClick(next);
@@ -374,9 +445,6 @@ namespace REPO_Active
 
             if (invokeOk)
             {
-                // Guard against false-positive activation:
-                // OnClick can succeed even if the EP doesn't actually enter an active state yet.
-                // Only mark as activated if its state is not Idle/Complete after the call.
                 var st = _scanner.ReadStateName(next);
                 if (!string.IsNullOrEmpty(st) &&
                     !ExtractionPointScanner.IsIdleLikeState(st) &&
@@ -412,8 +480,6 @@ namespace REPO_Active
             {
                 if (ep == null) yield break;
 
-                // Give the game short windows to advance EP state after OnClick.
-                // Longer retry window to reduce false "idle" after OnClick (more stable auto progression)
                 float[] waits = { 0.15f, 0.25f, 0.35f, 0.35f, 0.40f };
                 string lastState = "";
 
@@ -434,7 +500,6 @@ namespace REPO_Active
                         yield break;
                     }
 
-                    // Extra next-frame check after the first wait to catch one-frame late state changes.
                     if (i == 0)
                     {
                         yield return null;
@@ -474,7 +539,10 @@ namespace REPO_Active
                 _scanner.UpdateDiscovered(refPos, DISCOVER_RADIUS);
 
             var eligible = _discoverAllPoints.Value ? all : _scanner.FilterDiscovered(all);
-            var plan = _scanner.BuildStage1PlannedList(eligible, _scanner.GetSpawnPos(), refPos, skipActivated: SKIP_ACTIVATED);
+            var spawnPos = _scanner.GetSpawnPos();
+            var plan = _discoverAllPoints.Value
+                ? _scanner.BuildPlanDiscoverAllFixedAnchors(all, spawnPos, skipActivated: SKIP_ACTIVATED)
+                : _scanner.BuildStage1PlannedList(eligible, spawnPos, skipActivated: SKIP_ACTIVATED);
             if (plan.Count == 0) return;
 
             var first = plan[0];
@@ -485,14 +553,12 @@ namespace REPO_Active
             }
         }
 
-        private List<Vector3> TryGetAllPlayerPositionsHost(out bool anyMoved)
+        private List<Vector3> TryGetAllPlayerPositionsHost()
         {
-            anyMoved = false;
             var list = new List<Vector3>();
 
             try
             {
-                // [VERIFY] PhotonNetwork.InRoom / IsMasterClient exist in decompiled PhotonNetwork.cs.
                 var photonNetworkType = Type.GetType("Photon.Pun.PhotonNetwork, PhotonUnityNetworking");
                 if (photonNetworkType == null) return list;
 
@@ -504,7 +570,6 @@ namespace REPO_Active
 
                 if (!inRoom || !isMaster) return list;
 
-                // Prefer GameDirector.instance.PlayerList (more stable than name-based PhotonView scanning)
                 var gdType = Type.GetType("GameDirector, Assembly-CSharp");
                 if (gdType == null) return list;
 
@@ -531,15 +596,12 @@ namespace REPO_Active
                 var asEnumerable = playerListObj as System.Collections.IEnumerable;
                 if (asEnumerable == null) return list;
 
-                // Build a temp cache and hash to detect list changes
                 var temp = new List<Component>();
                 int hash = 17;
 
                 foreach (var p in asEnumerable)
                 {
                     if (p == null) continue;
-                    // GameDirector.PlayerList is List<PlayerAvatar> in decompiled GameDirector.cs.
-                    // So items are already PlayerAvatar (MonoBehaviour/Component).
                     var comp = ExtractPlayerComponent(p);
                     if (comp == null || comp.transform == null) continue;
 
@@ -560,10 +622,8 @@ namespace REPO_Active
                     {
                         _playerLastPos.Add(_playerCache[i].transform.position);
                     }
-                    anyMoved = true; // treat list changes as movement to trigger discovery
                 }
 
-                // Update positions and movement
                 for (int i = 0; i < _playerCache.Count; i++)
                 {
                     var comp = _playerCache[i];
@@ -577,14 +637,6 @@ namespace REPO_Active
 
                     var pos = comp.transform.position;
                     list.Add(pos);
-
-                    if (!anyMoved)
-                    {
-                        var prev = _playerLastPos[i];
-                        var d2 = (prev - pos).sqrMagnitude;
-                        if (d2 >= PLAYER_MOVE_THRESHOLD * PLAYER_MOVE_THRESHOLD)
-                            anyMoved = true;
-                    }
 
                     _playerLastPos[i] = pos;
                 }
@@ -601,7 +653,6 @@ namespace REPO_Active
         {
             if (p is Component comp && comp.transform != null) return comp;
 
-            // Fallback: if list items are wrappers, try PlayerAvatar property/field.
             var pt = p.GetType();
             object? avatarObj = null;
             var avatarProp = pt.GetProperty("PlayerAvatar", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
@@ -620,23 +671,10 @@ namespace REPO_Active
             return tr;
         }
 
-        private int GetCachedPlayerCount()
-        {
-            if (_playerCache.Count > 0) return _playerCache.Count;
-            return GetPlayerCountHost();
-        }
-
         private void UpdateDiscoveredFromCachedPlayers(Vector3 fallbackPos)
         {
-            // If we have cached player positions, use them to keep F3 consistent with auto discovery.
             if (_playerCache.Count > 0 && _playerLastPos.Count == _playerCache.Count)
             {
-                if (!_lastAnyMoved)
-                {
-                    _dbg?.Log("[F3] skip discover: no movement");
-                    return;
-                }
-
                 var spawnPos = _scanner.GetSpawnPos();
                 for (int i = 0; i < _playerLastPos.Count; i++)
                 {
@@ -659,7 +697,6 @@ namespace REPO_Active
                 return;
             }
 
-            // Fallback: local reference position only
             var newlyFallback = new List<Component>();
             int addedFallback = _scanner.UpdateDiscoveredDetailed(fallbackPos, DISCOVER_RADIUS, newlyFallback);
             if (addedFallback > 0 && _dbg != null)
@@ -678,18 +715,129 @@ namespace REPO_Active
             }
         }
 
+        private static string FormatEpShort(Component? ep)
+        {
+            if (ep == null) return "null";
+            var pos = ep.transform.position;
+            return $"{ep.gameObject.name}#{ep.GetInstanceID()}@({pos.x:0.00},{pos.y:0.00},{pos.z:0.00})";
+        }
+
+        private void LogDiscoveredPlanSummary(List<Component> plan, List<Component> allPoints, Vector3 spawnPos)
+        {
+            if (_dbg == null || plan == null || plan.Count == 0) return;
+
+            string first = FormatEpShort(plan[0]);
+            string tail = FormatEpShort(plan[plan.Count - 1]);
+
+            string middle;
+            if (plan.Count <= 2)
+            {
+                middle = "-";
+            }
+            else
+            {
+                var names = new List<string>();
+                for (int i = 1; i < plan.Count - 1; i++)
+                {
+                    names.Add(FormatEpShort(plan[i]));
+                }
+                middle = string.Join(" -> ", names);
+            }
+
+            string ordered = string.Join(" -> ", plan.Where(x => x != null).Select(x => FormatEpShort(x)));
+            _dbg.Log($"[PLAN][SUMMARY] first={first} middle={middle} tail={tail} ordered={ordered}");
+
+            if (_scanner.TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out var globalFirst, out var globalTail))
+            {
+                _dbg.Log($"[PLAN][GLOBAL] first={FormatEpShort(globalFirst)} tail={FormatEpShort(globalTail)} total={allPoints.Count}");
+            }
+        }
+        private bool ShouldHoldTailPointActivation(List<Component> allPoints, Vector3 spawnPos, List<Component> plan, Component next, out string reason)
+        {
+            reason = "";
+
+            if (_discoverAllPoints.Value) return false;
+            if (next == null) return false;
+
+            if (!_scanner.TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out var firstAnchor, out var tailAnchor))
+                return false;
+
+            if (tailAnchor == null) return false;
+
+            int firstId = firstAnchor != null ? firstAnchor.GetInstanceID() : int.MinValue;
+            int tailId = tailAnchor.GetInstanceID();
+            bool isTailTarget = next.GetInstanceID() == tailId;
+
+            var pendingNames = new List<string>();
+            for (int i = 0; i < allPoints.Count; i++)
+            {
+                var ep = allPoints[i];
+                if (!ep) continue;
+                int id = ep.GetInstanceID();
+                if (id == firstId || id == tailId) continue;
+
+                var st = _scanner.ReadStateName(ep);
+                if (ExtractionPointScanner.IsCompletedLikeState(st)) continue;
+
+                pendingNames.Add($"{FormatEpShort(ep)}({st})");
+            }
+
+            bool shouldHold = isTailTarget && pendingNames.Count > 0;
+            string queue = plan == null || plan.Count == 0
+                ? "-"
+                : string.Join(" -> ", plan.Where(x => x != null).Select(x => FormatEpShort(x)));
+
+            _dbg?.Log($"[TAIL][CHECK] globalFirst={FormatEpShort(firstAnchor)} globalTail={FormatEpShort(tailAnchor)} next={FormatEpShort(next)} isTailTarget={isTailTarget} pendingOthers={pendingNames.Count} hold={shouldHold} queue={queue}");
+
+            if (_lastTailHoldState.HasValue && _lastTailHoldState.Value && !shouldHold)
+            {
+                string releaseReason = !isTailTarget
+                    ? "next switched to non-tail target"
+                    : "all prerequisite points completed";
+                _dbg?.Log($"[TAIL][UNLOCK] reason={releaseReason} next={FormatEpShort(next)} queue={queue}");
+            }
+            _lastTailHoldState = shouldHold;
+
+            if (!shouldHold) return false;
+
+            reason = $"tail point locked, pendingOthers={pendingNames.Count}, pending=[{string.Join(", ", pendingNames)}], queue={queue}";
+            return true;
+        }
+
+        private void HandleRoomPopulationChangedEvent(string reason)
+        {
+            // 人数变化只更新扫描间隔与玩家缓存，不触发任何重排。
+            RefreshDiscoveryIntervalFromCurrentPlayerCount(reason, invalidateCache: true);
+        }
+
+        private void RefreshDiscoveryIntervalFromCurrentPlayerCount(string reason, bool invalidateCache)
+        {
+            int players = GetPlayerCountHost();
+            if (players < 1) players = 1;
+
+            if (players != _lastPlayerCount)
+            {
+                _lastPlayerCount = players;
+                _lastBaseInterval = ComputeDiscoveryInterval(players);
+                _dbg?.Log($"[DISCOVER] interval base={_lastBaseInterval:0.0}s players={players} reason={reason}");
+            }
+
+            if (invalidateCache)
+            {
+                _playerCache.Clear();
+                _playerLastPos.Clear();
+                _playerCacheHash = 0;
+            }
+        }
         private float GetDiscoveryInterval()
         {
             // When all points are treated as discovered, discovery polling does not need
             // dynamic player-based interval or empty-list penalties.
             if (_discoverAllPoints.Value) return DISCOVER_INTERVAL_BASE;
 
-            int players = GetCachedPlayerCount();
-            if (players != _lastPlayerCount)
+            if (_lastPlayerCount < 1)
             {
-                _lastPlayerCount = players;
-                _lastBaseInterval = ComputeDiscoveryInterval(players);
-                _dbg?.Log($"[DISCOVER] interval base={_lastBaseInterval:0.0}s players={players}");
+                RefreshDiscoveryIntervalFromCurrentPlayerCount("lazy init", invalidateCache: false);
             }
 
             float baseInterval = _lastBaseInterval;
@@ -699,7 +847,6 @@ namespace REPO_Active
             float interval = baseInterval * mult;
             return interval > DISCOVER_INTERVAL_MAX ? DISCOVER_INTERVAL_MAX : interval;
         }
-
         private void LogDiscoverState(string reason, int allCount, int discoveredCount)
         {
             if (_dbg == null) return;
@@ -720,6 +867,51 @@ namespace REPO_Active
             return DISCOVER_INTERVAL_10_12;
         }
 
+        private static void OnPlayerEnteredRoomPostfix()
+        {
+            _instance?.HandleRoomPopulationChangedEvent("player entered");
+        }
+
+        private static void OnPlayerLeftRoomPostfix()
+        {
+            _instance?.HandleRoomPopulationChangedEvent("player left");
+        }
+
+        private void InstallEventPatches()
+        {
+            try
+            {
+                _harmony = new Harmony(PluginGuid + ".population");
+                var networkType = AccessTools.TypeByName("NetworkManager");
+                var onEntered = networkType != null ? AccessTools.DeclaredMethod(networkType, "OnPlayerEnteredRoom") : null;
+                if (onEntered != null)
+                {
+                    _harmony.Patch(onEntered, postfix: new HarmonyMethod(typeof(Plugin), nameof(OnPlayerEnteredRoomPostfix)));
+                }
+
+                var onLeft = networkType != null ? AccessTools.DeclaredMethod(networkType, "OnPlayerLeftRoom") : null;
+                if (onLeft != null)
+                {
+                    _harmony.Patch(onLeft, postfix: new HarmonyMethod(typeof(Plugin), nameof(OnPlayerLeftRoomPostfix)));
+                }
+
+                _dbg?.Log("[PATCH] population patches installed");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"Failed to install population patches: {e}");
+            }
+        }
+
+        private void UninstallEventPatches()
+        {
+            try
+            {
+                _harmony?.UnpatchSelf();
+                _harmony = null;
+            }
+            catch { }
+        }
         private int GetPlayerCountHost()
         {
             try
@@ -749,6 +941,45 @@ namespace REPO_Active
 
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

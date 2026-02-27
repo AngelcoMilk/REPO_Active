@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("REPO_Active")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("4.0.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("4.0.2+ce2f605c02b6f6fb24ff765318ce60b729d328b9")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("4.0.2+47c1a206af8ea4b34c8086fc852b061ff7b61b45")]
 [assembly: System.Reflection.AssemblyProductAttribute("REPO_Active")]
 [assembly: System.Reflection.AssemblyTitleAttribute("REPO_Active")]
 [assembly: System.Reflection.AssemblyVersionAttribute("4.0.2.0")]
