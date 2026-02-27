@@ -1,17 +1,13 @@
-﻿using System;
+using System;
 using System.Reflection;
-using BepInEx.Logging;
 using UnityEngine;
 
 namespace REPO_Active.Reflection
 {
     public sealed class ExtractionPointInvoker
     {
-        private readonly ManualLogSource _log;
-
-        public ExtractionPointInvoker(ManualLogSource log)
+        public ExtractionPointInvoker()
         {
-            _log = log;
         }
 
         public bool InvokeOnClick(Component ep)
@@ -26,7 +22,6 @@ namespace REPO_Active.Reflection
                 var mi = t.GetMethod("OnClick", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 if (mi == null)
                 {
-                    _log.LogWarning($"OnClick not found on {t.FullName}. (No activation performed)");
                     return false;
                 }
 
@@ -35,9 +30,8 @@ namespace REPO_Active.Reflection
                 mi.Invoke(ep, args);
                 return true;
             }
-            catch (Exception e)
+            catch (Exception)
             {
-                _log.LogError($"InvokeOnClick failed: {e}");
                 return false;
             }
         }

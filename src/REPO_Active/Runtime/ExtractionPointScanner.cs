@@ -1,15 +1,13 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using BepInEx.Logging;
 using UnityEngine;
 
 namespace REPO_Active.Runtime
 {
     public sealed class ExtractionPointScanner
     {
-        private readonly ManualLogSource _log;
         // Verification notes (decompile cross-check):
         // - ExtractionPoint type and member currentState -> VERIFIED in Assembly-CSharp\ExtractionPoint.cs.
         // - UnityEngine.Object.FindObjectsOfType(Type) and Time.* are verified in UnityEngine.CoreModule.
@@ -38,15 +36,12 @@ namespace REPO_Active.Runtime
         // =====================
 
         public float RescanCooldown { get; set; }
-        public Action<string>? DebugLog { get; set; }
-        public bool LogReady { get; set; }
 
         public int CachedCount => _cached.Count;
         public int DiscoveredCount => _discovered.Count;
 
-        public ExtractionPointScanner(ManualLogSource log, float rescanCooldown)
+        public ExtractionPointScanner(float rescanCooldown)
         {
-            _log = log;
             RescanCooldown = rescanCooldown;
         }
 
@@ -87,15 +82,10 @@ namespace REPO_Active.Runtime
                 if (_lastScanCount != _cached.Count)
                 {
                     _lastScanCount = _cached.Count;
-                    if (LogReady)
-                        DebugLog?.Invoke($"[SCAN] count={_cached.Count} dt={dt:0.000}s");
                 }
             }
-            catch (Exception e)
+            catch (Exception)
             {
-                _log.LogError($"ScanIfNeeded failed: {e}");
-                if (LogReady)
-                    DebugLog?.Invoke($"[SCAN][ERR] {e.GetType().Name}: {e.Message}");
             }
         }
 
@@ -130,8 +120,6 @@ namespace REPO_Active.Runtime
             int added = _discovered.Count - before;
             if (added > 0)
             {
-                if (LogReady)
-                    DebugLog?.Invoke($"[DISCOVER] mark-all +{added} total={_discovered.Count}");
             }
         }
 
@@ -162,8 +150,6 @@ namespace REPO_Active.Runtime
             int added = _discovered.Count - before;
             if (added > 0 && newly == null)
             {
-                if (LogReady)
-                    DebugLog?.Invoke($"[DISCOVER] +{added} total={_discovered.Count} radius={radius:0.0}");
             }
             return added;
         }
@@ -191,8 +177,6 @@ namespace REPO_Active.Runtime
             if (_spawnPos != null) return;
             if (refPos == Vector3.zero) return;
             _spawnPos = refPos;
-            if (LogReady)
-                DebugLog?.Invoke($"[SPAWN] pos={refPos}");
         }
 
         public List<Component> ScanAndGetAllPoints()
@@ -334,8 +318,6 @@ namespace REPO_Active.Runtime
                     changed = true;
             }
 
-            if (changed && LogReady)
-                DebugLog?.Invoke($"[SYNC] activated marks reconciled cache={_activatedIds.Count} liveActive={liveActive.Count}");
 
             return changed;
         }
@@ -438,8 +420,8 @@ namespace REPO_Active.Runtime
         }
 
         /// <summary>
-        /// 鏋勫缓鈥淔3 椤哄簭婵€娲诲垪琛ㄢ€濓細
-        /// - 鍥哄畾绗竴涓細绂诲嚭鐢熺偣璺緞鏈€鐭殑鎻愬彇鐐?        /// - 鍥哄畾鏈€鍚庝竴涓細鍦ㄥ墿浣欑偣閲岋紝绂诲嚭鐢熺偣璺緞鏈€鐭?        /// - 涓棿锛氬叏鎺掑垪绌蜂妇锛屾寜鐐归棿 NavMesh 璺緞鎬婚暱搴︽眰鏈€浼?        /// - 璺宠繃宸插畬鎴?宸叉縺娲荤殑鐐?        /// - 涓嶄娇鐢ㄧ帺瀹朵綅缃紝涓嶄娇鐢ㄧ洿绾胯窛绂?        /// </summary>
+        /// 闂佸搫顑呯€氼剛绱撻幘璇茬伋婵? 婵＄偑鍊曢幖顐よ姳椤撶偐鏀介柍褜鍓欑叅閻犲洦褰冮悘娆撴偠濞戞牕濡烽柍褜鍓氱换鎰?
+        /// - 闂佹悶鍎遍幖顐︽偩閸撗呯當妞ゆ垼娉曢鍗炩槈閹垮啩鎮嶇紒杈ㄥ缁鎷犻幓鎺撶様闂佹眹鍨婚崰鎾诲磻閿濆洦宕夋い鏍ㄦ皑缁愮偤鏌￠崼姘壕闂佹椿鍙庨崢鎯р枔閹达箑绠甸柟閭﹀墮缁插潡鏌?        /// - 闂佹悶鍎遍幖顐︽偩妤ｅ啫瀚夐柍褜鍓熷畷銉︽償濠靛牜浼囨繛鎴炴惄娴滈妲愭导鏉戞嵍闁靛鍎遍埛鏍归敐鍡欐噮闁稿缍侀弻灞界暆鐎ｎ剛顦紓浣稿€介褔宕甸銏″仺闁绘柨鎼禒顖炴偣娓氼垰鐏犵紒鍓佸仱瀵敻鍩€椤掑嫭鍎?        /// - 婵炴垶鎼╅崣鍐ㄎ涢崸妤佹櫖婵﹩鍓欏鍧楁煙閻戞ê绗掗柛顭戜簽缁岸鎽庨崒姘兼喘闂佹寧绋戦張顒傗偓鍨矒閹瑨銇愰幒鎿勭吹 NavMesh 闁荤姳璀﹂崹鎵閻愬搫绠戝┑鐘崇濮ｆ劙骞栨潏楣冩闁活亙鍗冲鐢稿焵椤掍礁顕?        /// - 闁荤姴鎼悿鍥╂崲閸愵煈鍟呴柟缁樺笧閺嗘岸鏌?閻庡湱顭堝鍓佺紦閸濆娊娲嚒閵堝棛鏆犻梺?        /// - 婵炴垶鎸哥粔铏箾閸ヮ剚鍋ㄩ柕濞у啳绀嬮柣搴ゎ潐濠€鍦礊閸涱垳纾炬い鏇炴缁€澶娾槈閹惧磭小濠电偛娲幃浠嬪Ω瑜庣痪顖滅磼閹规劕鍔电紒鎰〒缁?        /// </summary>
         public List<Component> BuildStage1PlannedList(
             List<Component> allPoints,
             Vector3 spawnPos,
@@ -452,8 +434,6 @@ namespace REPO_Active.Runtime
             if (allPoints == null || allPoints.Count == 0) return result;
             if (spawnPos == Vector3.zero)
             {
-                if (LogReady)
-                    DebugLog?.Invoke("[PLAN][FAIL] spawnPos is zero; planning skipped");
                 return result;
             }
 
@@ -466,13 +446,11 @@ namespace REPO_Active.Runtime
                 var st = ReadStateName(ep);
                 if (IsCompletedLikeState(st))
                 {
-                    DebugLog?.Invoke($"[PLAN][SKIP] completed name={ep.gameObject.name} id={ep.GetInstanceID()} state={st}");
                     continue;
                 }
 
                 if (skipActivated && IsMarkedActivated(ep))
                 {
-                    DebugLog?.Invoke($"[PLAN][SKIP] activated name={ep.gameObject.name} id={ep.GetInstanceID()}");
                     continue;
                 }
 
@@ -492,8 +470,6 @@ namespace REPO_Active.Runtime
 
             if (reachable.Count == 0)
             {
-                if (LogReady)
-                    DebugLog?.Invoke("[PLAN][FAIL] no spawn-reachable extraction points");
                 return result;
             }
 
@@ -543,11 +519,8 @@ namespace REPO_Active.Runtime
             result.Add(first);
             if (restForLast.Count == 0)
             {
-                if (LogReady)
                 {
                     var dt1 = Time.realtimeSinceStartup - t0;
-                    DebugLog?.Invoke($"[PLAN] all={allPoints.Count} eligible=1 first={first.gameObject.name} firstId={firstId} firstSpawnPath={firstSpawnPath:0.00} dt={dt1:0.000}s");
-                    DebugLogPlanList(result, spawnPos, _spawnPathCache, _edgePathCache);
                 }
                 return result;
             }
@@ -639,8 +612,6 @@ namespace REPO_Active.Runtime
 
             if (bestMiddle == null)
             {
-                if (LogReady)
-                    DebugLog?.Invoke("[PLAN][FAIL] no valid NavMesh permutation between first and last");
                 return new List<Component>();
             }
 
@@ -649,10 +620,7 @@ namespace REPO_Active.Runtime
             result.Add(last);
 
             var dt = Time.realtimeSinceStartup - t0;
-            if (LogReady)
             {
-                DebugLog?.Invoke($"[PLAN] all={allPoints.Count} eligible={result.Count} first={first.gameObject.name} firstId={firstId} last={last.gameObject.name} lastId={lastId} firstSpawnPath={firstSpawnPath:0.00} lastSpawnPath={lastSpawnPath:0.00} bestTotal={bestTotal:0.00} dt={dt:0.000}s");
-                DebugLogPlanList(result, spawnPos, _spawnPathCache, _edgePathCache);
             }
             return result;
         }
@@ -669,15 +637,11 @@ namespace REPO_Active.Runtime
             if (allPoints == null || allPoints.Count == 0) return result;
             if (spawnPos == Vector3.zero)
             {
-                if (LogReady)
-                    DebugLog?.Invoke("[PLAN][ALL][FAIL] spawnPos is zero; planning skipped");
                 return result;
             }
 
             if (!TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out var globalFirst, out var globalTail) || globalFirst == null)
             {
-                if (LogReady)
-                    DebugLog?.Invoke("[PLAN][ALL][FAIL] no global anchors from all points");
                 return result;
             }
 
@@ -690,15 +654,11 @@ namespace REPO_Active.Runtime
                 var st = ReadStateName(ep);
                 if (IsCompletedLikeState(st))
                 {
-                    if (LogReady)
-                        DebugLog?.Invoke($"[PLAN][SKIP] completed name={ep.gameObject.name} id={ep.GetInstanceID()} state={st}");
                     continue;
                 }
 
                 if (skipActivated && IsMarkedActivated(ep))
                 {
-                    if (LogReady)
-                        DebugLog?.Invoke($"[PLAN][SKIP] activated name={ep.gameObject.name} id={ep.GetInstanceID()}");
                     continue;
                 }
 
@@ -718,8 +678,6 @@ namespace REPO_Active.Runtime
 
             if (reachable.Count == 0)
             {
-                if (LogReady)
-                    DebugLog?.Invoke("[PLAN][ALL][FAIL] no spawn-reachable extraction points");
                 return result;
             }
 
@@ -852,8 +810,6 @@ namespace REPO_Active.Runtime
 
             if (bestMiddle == null)
             {
-                if (LogReady)
-                    DebugLog?.Invoke("[PLAN][ALL][FAIL] no valid NavMesh permutation between fixed anchors");
                 return new List<Component>();
             }
 
@@ -862,13 +818,10 @@ namespace REPO_Active.Runtime
             if (tail != null)
                 result.Add(tail);
 
-            if (LogReady)
             {
                 var ordered = string.Join(" -> ", result.Where(x => x != null).Select(x => x.gameObject.name));
                 var tailName = tail != null ? tail.gameObject.name : "none";
                 var dt = Time.realtimeSinceStartup - t0;
-                DebugLog?.Invoke($"[PLAN][ALL] globalFirst={globalFirst.gameObject.name} globalTail={(globalTail != null ? globalTail.gameObject.name : "none")} first={first.gameObject.name} tail={tailName} ordered={ordered} bestTotal={bestTotal:0.00} dt={dt:0.000}s");
-                DebugLogPlanList(result, spawnPos, _spawnPathCache, _edgePathCache);
             }
 
             return result;
@@ -995,52 +948,9 @@ namespace REPO_Active.Runtime
             return false;
         }
 
-        private void DebugLogPlanList(
-            List<Component> plan,
-            Vector3 spawnPos,
-            Dictionary<int, float> spawnPathCache,
-            Dictionary<long, float> edgePathCache)
-        {
-            if (plan == null || plan.Count == 0) return;
-
-            for (int i = 0; i < plan.Count; i++)
-            {
-                var ep = plan[i];
-                if (!ep) continue;
-
-                var id = ep.GetInstanceID();
-                var st = ReadStateName(ep);
-                var act = IsMarkedActivated(ep);
-                var disc = _discovered.Contains(id);
-
-                string legFrom;
-                float legPath;
-
-                if (i == 0)
-                {
-                    legFrom = "spawn";
-                    if (!spawnPathCache.TryGetValue(id, out legPath))
-                    {
-                        if (!TryGetPathLength(spawnPos, ep.transform.position, out legPath)) legPath = -1f;
-                    }
-                }
-                else
-                {
-                    var prev = plan[i - 1];
-                    legFrom = prev ? prev.gameObject.name : "unknown";
-                    long key = prev ? MakeDirectedKey(prev.GetInstanceID(), id) : 0;
-                    if (!edgePathCache.TryGetValue(key, out legPath))
-                    {
-                        if (!(prev && TryGetPathLength(prev.transform.position, ep.transform.position, out legPath)))
-                            legPath = -1f;
-                    }
-                }
-
-                DebugLog?.Invoke($"[PLAN][{i}] name={ep.gameObject.name} legFrom={legFrom} legPath={legPath:0.00} discovered={disc} activated={act} state={st}");
-            }
-        }
     }
 }
+
 
 
 

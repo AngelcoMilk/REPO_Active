@@ -4,24 +4,15 @@
     <TargetFramework>netstandard2.1</TargetFramework>
     <LangVersion>latest</LangVersion>
     <AssemblyName>REPO_Active</AssemblyName>
-    <Version>4.0.2</Version>
+    <Version>5.1.0</Version>
     <Nullable>enable</Nullable>
-    <EnableFileLog Condition="'$(EnableFileLog)'==''">true</EnableFileLog>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(EnableFileLog)'=='true'">
-    <DefineConstants>$(DefineConstants);WITH_FILE_LOG</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="BepInEx.Core" Version="5.4.21" />
   </ItemGroup>
 
-  <ItemGroup Condition="'$(EnableFileLog)'!='true'">
-    <Compile Remove="Debug\ModLogger.cs" />
-  </ItemGroup>
-
-  <!-- ✅ 你需要把 UnityManagedPath 指向：REPO_Data/Managed -->
+  <!-- You need to point UnityManagedPath to: REPO_Data/Managed -->
   <PropertyGroup>
     <UnityManagedPath>C:\Program Files (x86)\Steam\steamapps\common\REPO\REPO_Data\Managed</UnityManagedPath>
   </PropertyGroup>

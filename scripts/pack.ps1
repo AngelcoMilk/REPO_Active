@@ -11,7 +11,6 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
-$enableFileLog = if ($Variant -eq "test") { "true" } else { "false" }
 if ([string]::IsNullOrWhiteSpace($OutputZip)) {
     $OutputZip = ".\REPO_Active_${Variant}_r2modman.zip"
 }
@@ -44,16 +43,18 @@ if ([string]::IsNullOrWhiteSpace($websiteUrl) -or -not $websiteUrl.StartsWith("h
     throw "Invalid website_url in manifest.json: '$websiteUrl' (must be non-empty https URL)"
 }
 Write-Host "[PACK] website check ok: $websiteUrl"
-Write-Host "[PACK] variant=$Variant EnableFileLog=$enableFileLog"
+Write-Host "[PACK] variant=$Variant"
 
 Write-Host "[PACK] build start"
-$buildArgs = @($ProjectPath, "-c", $Configuration, "/p:EnableFileLog=$enableFileLog")
+$buildArgs = @($ProjectPath, "-c", $Configuration)
 dotnet build @buildArgs | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "dotnet build failed with exit code $LASTEXITCODE" }
 
 if (!(Test-Path $pluginDll)) {
     throw "Build output not found: $pluginDll"
 }
-
+$pluginHash = (Get-FileHash -Path $pluginDll -Algorithm SHA256).Hash
+Write-Host "[PACK] dll sha256: $pluginHash"
 if (Test-Path $staging) {
     Remove-Item $staging -Recurse -Force
 }
@@ -70,6 +71,20 @@ $bytes = [System.IO.File]::ReadAllBytes((Join-Path $staging "README.md"))
 if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
     throw "README.md in package has UTF-8 BOM. Re-save without BOM before packaging."
 }
+
+# Staging consistency checks
+$stagedDll = Join-Path $staging "BepInEx\plugins\REPO_Active\REPO_Active.dll"
+$stagedHash = (Get-FileHash -Path $stagedDll -Algorithm SHA256).Hash
+if ($stagedHash -ne $pluginHash) {
+    throw "Staged DLL hash mismatch: build=$pluginHash staged=$stagedHash"
+}
+
+$stagedManifestObj = Get-Content (Join-Path $staging "manifest.json") -Raw | ConvertFrom-Json
+$stagedVersion = [string]$stagedManifestObj.version_number
+if ($stagedVersion -ne $pluginVersion) {
+    throw "Staged manifest version mismatch: staged=$stagedVersion expected=$pluginVersion"
+}
+Write-Host "[PACK] staging checks ok"
 
 $packFiles = @(
     (Join-Path $staging "BepInEx\plugins\REPO_Active\REPO_Active.dll"),
@@ -89,5 +104,14 @@ if (Test-Path $OutputZip) {
 }
 
 Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $OutputZip -CompressionLevel Optimal
+
+if (!(Test-Path $OutputZip)) {
+    throw "Output zip missing: $OutputZip"
+}
+$zipItem = Get-Item $OutputZip
+if ($zipItem.Length -le 0) {
+    throw "Output zip is empty: $OutputZip"
+}
+Write-Host "[PACK] zip checks ok size=$($zipItem.Length)"
 
 Write-Host "[PACK] done -> $OutputZip"

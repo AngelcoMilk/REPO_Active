@@ -1,49 +1,50 @@
 # REPO_Active v5.1.0
 
 This is a practical mod for REPO:
-it supports **remote extraction-point activation** through the game's native `ExtractionPoint.OnClick()` logic.
-It keeps full in-game feedback (broadcast + marker + reward), and provides stable planning order, manual control, and optional auto mode.
-This mod helps reduce map-running pressure and noticeably improves the overall gameplay flow.
-**TL;DR: this mod guarantees the last point is the one closest to spawn, so full submission routes can return home more smoothly. Middle extraction points are activated in a globally shortest-path order, effectively like having a reliable teammate pre-plan and guide your route.**
-**It supports `manual/auto modes`, whether to `discover all extraction points by default`, activation only among `player-discovered extraction points` (to preserve exploration), and can even `activate points in other players' rooms` with optimized routing (this was an accidental behavior, not the original goal, but it may still help some users).**
+it supports **remote extraction-point activation** using the game's native `ExtractionPoint.OnClick()` logic.
+It keeps full in-game feedback (broadcast + marker + reward), and provides stable route planning, manual control, and optional auto mode.
+This mod reduces map-running pressure and improves overall gameplay flow.
+**TL;DR: the mod guarantees the last point is the one closest to spawn, which makes full submission routes easier to finish and return. Middle extraction points are ordered by global shortest-path planning, like having a reliable teammate pre-plan and guide your route.**
+**It supports `manual/auto modes`, whether to `discover all extraction points by default`, activation only among `player-discovered extraction points` (to preserve exploration gameplay), and even `remote activation in other players' rooms` (an accidental but potentially useful behavior).**
 
 ## Extraction Point States
-- **Extraction Point**: an evac point on the map that can be opened.
-- **Not Activated**: an evac point that has not been opened yet.
-- **Activated**: an evac point that is already opened (currently active).
-- **Submitted / Completed**: this evac point has already been submitted and will no longer participate in later activation.
+- **Extraction point**: a map point that can be opened.
+- **Not activated**: the point has not been opened yet.
+- **Activated**: the point is currently open and active.
+- **Submitted/Completed**: this point is finished and no longer joins later activation steps.
 
 ## Features
 
-- **Remote activation with native behavior preserved**: uses the same OnClick logic as in-game interaction, with the same result as manually pressing the activation button.
-- **Predictable order**: queue planning is based on NavMesh path distance to reduce backtracking. Rule: fixed spawn-nearest extraction point as first, fixed spawn-nearest point among the remaining as last, middle points sorted by optimal inter-point path, and automatic re-planning on unexpected activation.
-- **Safety first**: when a point is already active, no new activation is started.
-- **Discovery filtering**: when `DiscoverAllPoints=false`, only discovered points can be activated.
-- **Multiplayer friendly (host)**: discovery logic can combine all players' positions and is applied by host authority.
+- **Remote activation with native behavior**: uses the same OnClick logic as in-game interaction, with results equivalent to pressing the extraction-point activation button manually.
+- **Predictable order**: queue planning is based on NavMesh path distance to reduce backtracking. Rule: lock the spawn-nearest point as first, lock the nearest-to-spawn among remaining points as last, order middle points by inter-point optimal path, and auto-replan when unexpected activation happens.
+- **Safety first**: when a point is already active, the mod will not start another activation.
+- **Discovery filter**: when `DiscoverAllPoints=false`, only discovered points are eligible for activation.
+- **Multiplayer host flow**: discovery logic can combine all players' positions and is applied by the host.
+- **Manual-mode exploration planning**: the spawn-nearest remaining point is locked as the final activation target (regardless of discovery); it is only allowed when it is the only point left on the map.
 
-## Issues Fixed
-- Fixed common "wrong activation / order jumping" behavior — previous logic used straight-line coordinate distance, which caused activation-order errors.
-- Route ordering is now more reasonable: it uses **actual path distance**, not just straight-line distance.
-- If a point is already active, no new point is force-opened, avoiding conflicts.
-- This version should be the finalized stable version.
+## Fixed Issues
+- Fixed the common "random activation / wrong order" problem. The old behavior used straight-line coordinate distance, which could produce wrong activation order.
+- Route ordering is now more reasonable: it uses **actual path distance**, not only linear distance.
+- If a point is already active, the mod will not force-open a new one, avoiding conflicts.
+- This version should be the stable complete version.
 
 ## Current Activation Rules
-1. Find candidate points first (all points or discovered-only).
-2. Generate an "activation queue".
+1. Build candidate points (all points or discovered-only).
+2. Generate one activation queue.
 3. Activate only the first point in the queue each time.
-4. If the actually activated point is not the target point, rebuild the queue immediately.
+4. If the actual activated point is not the target point, replan the queue immediately.
 5. If any point is currently active, do not send a new activation request.
 
-## Keybind
+## Hotkey
 - `F3`: in manual mode, activate the next point in the queue.
 
 ## Configuration
 Config file: `BepInEx\\config\\angelcomilk.repo_active.cfg`
 
 - `AutoActivate`: whether to auto-activate extraction points.
-- `ActivateNearest`: manual activation key (default `F3`).
+- `ActivateNearest`: manual activation hotkey (default `F3`).
 - `DiscoverAllPoints`: whether all extraction points are discovered by default.
-- `EnforceHostAuthority`: in multiplayer, whether only host can execute extraction-point activation — if this restriction is disabled, you can remotely activate extraction points in other players' rooms. This was not the original design goal, but it may still be useful (in this case, non-host clients cannot use other players' positions to mark discovery state).
+- `EnforceHostAuthority`: in multiplayer, whether only the host can activate extraction points. If disabled, remote activation can be used in other players' rooms (not the original design intent, but potentially useful). In that case, non-host cannot use other players' positions to mark discovery.
 
 ## Installation (r2modman)
 1. Import the zip.
@@ -76,6 +77,7 @@ Config file: `BepInEx\\config\\angelcomilk.repo_active.cfg`
 - **安全优先**：当已有提取点处于激活中时，不会启动新的激活。
 - **发现过滤**：当 `DiscoverAllPoints=false` 时，仅已发现的点参与激活。
 - **多人友好（主机）**：发现逻辑可结合所有玩家位置，由主机统一生效。
+- **手动模式探索规划**：距离出生点最近的提取点会的排序会固定在最后激活 (无论是否发现，只有当地图上只剩这个末尾提取点时才会进入激活)
 
 ## 修复的问题
 - 修复了“乱激活、跳顺序”的常见问题 —— 因为之前是按照提取点的坐标进行直线计算的，所以会出现激活顺序问题。
