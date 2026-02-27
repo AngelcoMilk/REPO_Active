@@ -1,0 +1,22 @@
+# Build outputs
+bin/
+obj/
+dist/
+
+# Package artifacts
+*.zip
+
+# User/local files
+*.user
+*.suo
+*.cache
+*.log
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
