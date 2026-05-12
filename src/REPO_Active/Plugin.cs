@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using BepInEx;
 using BepInEx.Configuration;
@@ -16,7 +17,7 @@ namespace REPO_Active
     {
         public const string PluginGuid = "angelcomilk.repo_active";
         public const string PluginName = "REPO_Active";
-        public const string PluginVersion = "5.2.1";
+        public const string PluginVersion = "5.2.2";
 
         private const float RescanCooldown = 0.6f;
         private const bool SkipActivated = true;
@@ -30,7 +31,7 @@ namespace REPO_Active
         private const float AutoReadyBuffer = 30f;
 
         private ConfigEntry<bool> _autoActivate = null!;
-        private ConfigEntry<KeyCode> _keyActivateNearest = null!;
+        private ConfigEntry<KeyboardShortcut> _keyActivateNearest = null!;
         private ConfigEntry<bool> _discoverAllPoints = null!;
 
         private readonly HashSet<int> _deferredMarking = new HashSet<int>();
@@ -53,6 +54,8 @@ namespace REPO_Active
         private string _lastBusyInfo = "";
         private int _lastBusyCount = -1;
         private float _lastBusyLogTime = -1f;
+        private string _lastStatusLog = "";
+        private float _lastStatusLogTime = -1f;
         private bool? _lastTailHoldState;
 
         internal static Plugin? Instance { get; private set; }
@@ -61,9 +64,15 @@ namespace REPO_Active
 
         private void Awake()
         {
-            _autoActivate = Config.Bind("Auto", "AutoActivate", false, "Auto activate when idle.");
-            _keyActivateNearest = Config.Bind("Keybinds", "ActivateNearest", KeyCode.F3, "Press to activate next extraction point.");
-            _discoverAllPoints = Config.Bind("Discovery", "DiscoverAllPoints", false, "If true, treat all extraction points as discovered.");
+            MigrateLegacyConfigIfNeeded(
+                out var defaultAutoActivate,
+                out var defaultDiscoverAll,
+                out var defaultShortcut);
+
+            _autoActivate = Config.Bind("Auto", "AutoActivate", defaultAutoActivate, "Auto activate when idle.");
+            _keyActivateNearest = Config.Bind("Keybinds", "ActivateNearestShortcut", defaultShortcut, "Press to activate next extraction point.");
+            _discoverAllPoints = Config.Bind("Discovery", "DiscoverAllPoints", defaultDiscoverAll, "If true, treat all extraction points as discovered.");
+            Config.Save();
 
             Instance = this;
             _scanner = new ExtractionPointScanner(RescanCooldown, StateTracker);
@@ -72,7 +81,7 @@ namespace REPO_Active
             _harmony.PatchAll(typeof(Plugin).Assembly);
 
             SceneManager.sceneLoaded += OnSceneLoaded;
-            Logger.LogInfo($"{PluginName} {PluginVersion} loaded for the strong-typed REPO build.");
+            Logger.LogInfo($"{PluginName} {PluginVersion} loaded. Auto={_autoActivate.Value}, DiscoverAll={_discoverAllPoints.Value}, Key={_keyActivateNearest.Value}, Config={Config.ConfigFilePath}");
         }
 
         private void OnDestroy()
@@ -102,7 +111,7 @@ namespace REPO_Active
 
         private void Update()
         {
-            if (Input.GetKeyDown(_keyActivateNearest.Value) && !_autoActivate.Value)
+            if (_keyActivateNearest.Value.IsDown() && !_autoActivate.Value)
             {
                 ActivateNearest();
             }
@@ -129,6 +138,11 @@ namespace REPO_Active
                     _scanner.CaptureSpawnPosIfNeeded(refPos);
                     _autoReadyTime = Time.realtimeSinceStartup;
                     _autoTimer = 0f;
+                    LogStatus($"auto ready: points={all.Count}, ref={FormatVector(refPos)}, waiting={AutoReadyBuffer:0}s buffer");
+                }
+                else
+                {
+                    LogStatus($"auto waiting: points={all.Count}, ref={(refPos == Vector3.zero ? "zero" : FormatVector(refPos))}", 5f);
                 }
 
                 return;
@@ -228,6 +242,7 @@ namespace REPO_Active
             var allPoints = _scanner.ScanAndGetAllPoints();
             if (allPoints.Count == 0)
             {
+                LogStatus("activate skipped: no extraction points found", 3f);
                 return;
             }
 
@@ -239,6 +254,7 @@ namespace REPO_Active
                     _lastBusyInfo = busyInfo;
                     _lastBusyCount = busyCount;
                     _lastBusyLogTime = now;
+                    Logger.LogInfo($"activate blocked: busy={busyCount}, {busyInfo}");
                 }
 
                 return;
@@ -265,22 +281,25 @@ namespace REPO_Active
 
             if (plan.Count == 0)
             {
+                LogStatus($"activate skipped: empty plan all={allPoints.Count}, eligible={eligible.Count}, discovered={_scanner.DiscoveredCount}, spawn={FormatVector(spawnPos)}", 3f);
                 return;
             }
 
             var next = plan[0];
-            if (ShouldHoldTailPointActivation(allPoints, spawnPos, plan, next, out _))
+            if (ShouldHoldTailPointActivation(allPoints, spawnPos, plan, next, out var holdReason))
             {
+                LogStatus($"activate held: {holdReason}", 3f);
                 return;
             }
 
             try
             {
                 next.OnClick();
+                Logger.LogInfo($"activate invoked: {next.gameObject.name}#{next.GetInstanceID()}");
             }
             catch (Exception ex)
             {
-                Logger.LogWarning($"ExtractionPoint.OnClick failed: {ex.GetType().Name}");
+                Logger.LogWarning($"ExtractionPoint.OnClick failed: {ex.GetType().Name}: {ex.Message}");
                 return;
             }
 
@@ -694,6 +713,140 @@ namespace REPO_Active
         internal static void NotifyExtractionPointState(ExtractionPoint point, ExtractionPoint.State state)
         {
             Instance?.StateTracker.Record(point, state);
+        }
+
+        private void MigrateLegacyConfigIfNeeded(
+            out bool defaultAutoActivate,
+            out bool defaultDiscoverAll,
+            out KeyboardShortcut defaultShortcut)
+        {
+            defaultAutoActivate = false;
+            defaultDiscoverAll = false;
+            defaultShortcut = new KeyboardShortcut(KeyCode.F3);
+
+            string path = Config.ConfigFilePath;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            {
+                return;
+            }
+
+            string text;
+            try
+            {
+                text = File.ReadAllText(path);
+            }
+            catch
+            {
+                return;
+            }
+
+            if (TryReadConfigValue(text, "AutoActivate", out var autoText) &&
+                bool.TryParse(autoText, out var autoValue))
+            {
+                defaultAutoActivate = autoValue;
+            }
+
+            if (TryReadConfigValue(text, "DiscoverAllPoints", out var discoverText) &&
+                bool.TryParse(discoverText, out var discoverValue))
+            {
+                defaultDiscoverAll = discoverValue;
+            }
+
+            if (TryReadConfigValue(text, "ActivateNearestShortcut", out var shortcutText) ||
+                TryReadConfigValue(text, "ActivateNearest", out shortcutText))
+            {
+                try
+                {
+                    defaultShortcut = KeyboardShortcut.Deserialize(shortcutText);
+                }
+                catch
+                {
+                    defaultShortcut = new KeyboardShortcut(KeyCode.F3);
+                }
+            }
+
+            bool needsCleanRewrite =
+                text.IndexOf("Setting type: KeyCode", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                text.IndexOf("Acceptable values:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                text.IndexOf("BuildQueueAndRun", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                text.IndexOf("EnforceHostAuthority", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (!needsCleanRewrite)
+            {
+                return;
+            }
+
+            try
+            {
+                string backup = path + ".bak." + DateTime.Now.ToString("yyyyMMddHHmmss");
+                File.Copy(path, backup, overwrite: false);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Config.Clear();
+                File.Delete(path);
+                Config.Reload();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"legacy config cleanup failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private static bool TryReadConfigValue(string text, string key, out string value)
+        {
+            value = "";
+            using (var reader = new StringReader(text))
+            {
+                string? line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length == 0 || trimmed[0] == '#')
+                    {
+                        continue;
+                    }
+
+                    int equals = trimmed.IndexOf('=');
+                    if (equals <= 0)
+                    {
+                        continue;
+                    }
+
+                    string candidateKey = trimmed.Substring(0, equals).Trim();
+                    if (!string.Equals(candidateKey, key, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    value = trimmed.Substring(equals + 1).Trim();
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void LogStatus(string message, float cooldownSeconds = 2f)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (message == _lastStatusLog && now - _lastStatusLogTime < cooldownSeconds)
+            {
+                return;
+            }
+
+            _lastStatusLog = message;
+            _lastStatusLogTime = now;
+            Logger.LogInfo(message);
+        }
+
+        private static string FormatVector(Vector3 value)
+        {
+            return $"({value.x:0.0},{value.y:0.0},{value.z:0.0})";
         }
     }
 

@@ -1,6 +1,6 @@
 # REPO_Active 技术说明（当前版本）
 
-适用版本：`5.2.1`
+适用版本：`5.2.2`
 源码根目录：`C:\Users\Home\Documents\GitHub\REPO_Active`
 
 ## 1. 目标与边界
@@ -34,8 +34,8 @@
 - `AutoActivate`（bool）
   - `false`：手动模式，仅 `F3` 触发。
   - `true`：自动模式，按定时流程触发。
-- `ActivateNearest`（KeyCode）
-  - 手动激活按键，默认 `F3`。
+- `ActivateNearestShortcut`（KeyboardShortcut）
+  - 手动激活快捷键，默认 `F3`，避免旧 `KeyCode` 配置写入过长枚举导致配置界面卡住。
 - `DiscoverAllPoints`（bool）
   - `true`：全图默认已发现。
   - `false`：按玩家位置半径动态发现。
