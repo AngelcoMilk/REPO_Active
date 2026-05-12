@@ -1,4 +1,4 @@
-# REPO_Active v5.2.2
+# REPO_Active v5.2.3
 
 This is a practical mod for REPO:
 it supports **remote extraction-point activation** using the game's native `ExtractionPoint.OnClick()` logic.
@@ -42,7 +42,7 @@ This mod reduces map-running pressure and improves overall gameplay flow.
 Config file: `BepInEx\\config\\angelcomilk.repo_active.cfg`
 
 - `AutoActivate`: whether to auto-activate extraction points.
-- `ActivateNearestShortcut`: manual activation shortcut (default `F3`).
+- `ActivateNearestKey`: manual activation key (default `F3`).
 - `DiscoverAllPoints`: whether all extraction points are discovered by default.
 
 ## Installation (r2modman)
@@ -54,7 +54,7 @@ Config file: `BepInEx\\config\\angelcomilk.repo_active.cfg`
 **AngelcoMilk - Angel Cotton**
 ---
 
-# REPO_Active v5.2.2
+# REPO_Active v5.2.3
 
 这是一个给 REPO 用的实用模组：
 它可以**远程激活提取点**，而且走的是游戏原生 `ExtractionPoint.OnClick()` 逻辑。
@@ -98,7 +98,7 @@ Config file: `BepInEx\\config\\angelcomilk.repo_active.cfg`
 配置文件：`BepInEx\\config\\angelcomilk.repo_active.cfg`
 
 - `AutoActivate`：是否自动激活提取点。
-- `ActivateNearestShortcut`：手动激活快捷键（默认 `F3`）。
+- `ActivateNearestKey`：手动激活按键（默认 `F3`）。
 - `DiscoverAllPoints`：是否默认全图提取点已发现。
 
 ## 安装（r2modman）

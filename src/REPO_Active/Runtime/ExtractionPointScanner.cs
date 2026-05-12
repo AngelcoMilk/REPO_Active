@@ -10,6 +10,7 @@ namespace REPO_Active.Runtime
     {
         private readonly ExtractionPointStateTracker _stateTracker;
         private readonly List<ExtractionPoint> _cached = new List<ExtractionPoint>();
+        private readonly HashSet<int> _cachedIds = new HashSet<int>();
         private readonly HashSet<int> _activatedIds = new HashSet<int>();
         private readonly HashSet<int> _discovered = new HashSet<int>();
         private readonly Dictionary<int, float> _spawnPathCache = new Dictionary<int, float>();
@@ -18,52 +19,41 @@ namespace REPO_Active.Runtime
         private readonly HashSet<long> _edgePathInvalid = new HashSet<long>();
 
         private Vector3? _spawnPos;
-        private float _lastScanRealtime;
-        private int _lastScanCount = -1;
         private int? _firstAnchorId;
         private int? _lastAnchorId;
-
-        public float RescanCooldown { get; set; }
 
         public int CachedCount => _cached.Count;
 
         public int DiscoveredCount => _discovered.Count;
 
-        public ExtractionPointScanner(float rescanCooldown, ExtractionPointStateTracker stateTracker)
+        public ExtractionPointScanner(ExtractionPointStateTracker stateTracker)
         {
-            RescanCooldown = rescanCooldown;
             _stateTracker = stateTracker;
         }
 
-        public void ScanIfNeeded(bool force)
+        public bool RegisterPoint(ExtractionPoint point)
         {
-            try
+            if (!point)
             {
-                float now = Time.realtimeSinceStartup;
-                if (!force && now - _lastScanRealtime < RescanCooldown)
-                {
-                    return;
-                }
-
-                _lastScanRealtime = now;
-                var found = UnityEngine.Object.FindObjectsOfType<ExtractionPoint>();
-                _cached.Clear();
-                _cached.AddRange(found.Where(point => point));
-
-                if (_lastScanCount != _cached.Count)
-                {
-                    _lastScanCount = _cached.Count;
-                }
+                return false;
             }
-            catch
+
+            PruneInvalidCachedPoints();
+            int id = point.GetInstanceID();
+            if (_cachedIds.Contains(id))
             {
+                return false;
             }
+
+            _cachedIds.Add(id);
+            _cached.Add(point);
+            return true;
         }
 
-        public List<ExtractionPoint> ScanAndGetAllPoints()
+        public List<ExtractionPoint> GetAllPoints()
         {
-            ScanIfNeeded(force: true);
-            return _cached.Where(point => point).ToList();
+            PruneInvalidCachedPoints();
+            return new List<ExtractionPoint>(_cached);
         }
 
         public Vector3 GetReferencePos()
@@ -235,6 +225,7 @@ namespace REPO_Active.Runtime
         public void ResetForNewRound()
         {
             _cached.Clear();
+            _cachedIds.Clear();
             _activatedIds.Clear();
             _discovered.Clear();
             _spawnPos = null;
@@ -244,8 +235,6 @@ namespace REPO_Active.Runtime
             _edgePathInvalid.Clear();
             _firstAnchorId = null;
             _lastAnchorId = null;
-            _lastScanRealtime = 0f;
-            _lastScanCount = -1;
         }
 
         public void MarkActivated(ExtractionPoint point)
@@ -266,6 +255,35 @@ namespace REPO_Active.Runtime
             return _stateTracker.ReadStateName(point);
         }
 
+        private void PruneInvalidCachedPoints()
+        {
+            for (int i = _cached.Count - 1; i >= 0; i--)
+            {
+                var point = _cached[i];
+                if (point)
+                {
+                    continue;
+                }
+
+                _cached.RemoveAt(i);
+            }
+
+            if (_cachedIds.Count == _cached.Count)
+            {
+                return;
+            }
+
+            _cachedIds.Clear();
+            for (int i = 0; i < _cached.Count; i++)
+            {
+                var point = _cached[i];
+                if (point)
+                {
+                    _cachedIds.Add(point.GetInstanceID());
+                }
+            }
+        }
+
         public bool TryGetActivatingInfo(List<ExtractionPoint> allPoints, out string info, out int busyCount)
         {
             info = "";
@@ -284,9 +302,7 @@ namespace REPO_Active.Runtime
                 }
 
                 var state = ReadState(point);
-                if (!state.HasValue ||
-                    IsIdleLikeState(state) ||
-                    IsCompletedLikeState(state))
+                if (!state.HasValue || !IsBlockingState(state.Value))
                 {
                     continue;
                 }
@@ -303,12 +319,23 @@ namespace REPO_Active.Runtime
 
         internal static bool IsIdleLikeState(ExtractionPoint.State? state)
         {
-            return state == ExtractionPoint.State.None || state == ExtractionPoint.State.Idle;
+            return state == ExtractionPoint.State.None ||
+                   state == ExtractionPoint.State.Idle ||
+                   state == ExtractionPoint.State.Cancel;
         }
 
         internal static bool IsCompletedLikeState(ExtractionPoint.State? state)
         {
             return state == ExtractionPoint.State.Success || state == ExtractionPoint.State.Complete;
+        }
+
+        internal static bool IsBlockingState(ExtractionPoint.State? state)
+        {
+            return state == ExtractionPoint.State.Active ||
+                   state == ExtractionPoint.State.Warning ||
+                   state == ExtractionPoint.State.Extracting ||
+                   state == ExtractionPoint.State.Surplus ||
+                   state == ExtractionPoint.State.TaxReturn;
         }
 
         public List<ExtractionPoint> BuildStage1PlannedList(

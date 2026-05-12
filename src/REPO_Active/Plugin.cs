@@ -17,21 +17,17 @@ namespace REPO_Active
     {
         public const string PluginGuid = "angelcomilk.repo_active";
         public const string PluginName = "REPO_Active";
-        public const string PluginVersion = "5.2.2";
+        public const string PluginVersion = "5.2.3";
 
-        private const float RescanCooldown = 0.6f;
         private const bool SkipActivated = true;
-        private const float AutoInterval = 5.0f;
-        private const float DiscoverIntervalBase = 0.5f;
-        private const float DiscoverInterval4To6 = 1.0f;
-        private const float DiscoverInterval7To9 = 1.5f;
-        private const float DiscoverInterval10To12 = 2.0f;
-        private const float DiscoverIntervalMax = 3.0f;
         private const float DiscoverRadius = 20f;
         private const float AutoReadyBuffer = 30f;
+        private const float AutoEventDelay = 0.35f;
+
+        private static readonly string[] KeyOptions = BuildKeyOptions();
 
         private ConfigEntry<bool> _autoActivate = null!;
-        private ConfigEntry<KeyboardShortcut> _keyActivateNearest = null!;
+        private ConfigEntry<string> _keyActivateNearest = null!;
         private ConfigEntry<bool> _discoverAllPoints = null!;
 
         private readonly HashSet<int> _deferredMarking = new HashSet<int>();
@@ -40,23 +36,13 @@ namespace REPO_Active
 
         private ExtractionPointScanner _scanner = null!;
         private Harmony? _harmony;
+        private Coroutine? _autoCoroutine;
 
-        private float _autoTimer;
-        private float _discoverTimer;
-        private float _autoReadyTime = -1f;
-        private float _discoverReadyTime = -1f;
+        private KeyCode _activateKey = KeyCode.F3;
+        private float _autoReadyAt = -1f;
+        private bool _levelReady;
         private bool _autoPrimed;
         private int _playerCacheHash;
-        private int _playerListEmptyStreak;
-        private int _lastPlayerCount = -1;
-        private float _lastBaseInterval = DiscoverIntervalBase;
-        private int _lastHostPosCount = -1;
-        private string _lastBusyInfo = "";
-        private int _lastBusyCount = -1;
-        private float _lastBusyLogTime = -1f;
-        private string _lastStatusLog = "";
-        private float _lastStatusLogTime = -1f;
-        private bool? _lastTailHoldState;
 
         internal static Plugin? Instance { get; private set; }
 
@@ -67,21 +53,28 @@ namespace REPO_Active
             MigrateLegacyConfigIfNeeded(
                 out var defaultAutoActivate,
                 out var defaultDiscoverAll,
-                out var defaultShortcut);
+                out var defaultKey);
 
             _autoActivate = Config.Bind("Auto", "AutoActivate", defaultAutoActivate, "Auto activate when idle.");
-            _keyActivateNearest = Config.Bind("Keybinds", "ActivateNearestShortcut", defaultShortcut, "Press to activate next extraction point.");
+            _keyActivateNearest = Config.Bind(
+                "Keybinds",
+                "ActivateNearestKey",
+                SanitizeKeyName(defaultKey),
+                new ConfigDescription(
+                    "Press to activate next extraction point.",
+                    new AcceptableValueList<string>(KeyOptions)));
             _discoverAllPoints = Config.Bind("Discovery", "DiscoverAllPoints", defaultDiscoverAll, "If true, treat all extraction points as discovered.");
+            _keyActivateNearest.SettingChanged += (_, _) => RefreshActivateKey();
+            RefreshActivateKey();
             Config.Save();
 
             Instance = this;
-            _scanner = new ExtractionPointScanner(RescanCooldown, StateTracker);
+            _scanner = new ExtractionPointScanner(StateTracker);
 
             _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll(typeof(Plugin).Assembly);
 
             SceneManager.sceneLoaded += OnSceneLoaded;
-            Logger.LogInfo($"{PluginName} {PluginVersion} loaded. Auto={_autoActivate.Value}, DiscoverAll={_discoverAllPoints.Value}, Key={_keyActivateNearest.Value}, Config={Config.ConfigFilePath}");
         }
 
         private void OnDestroy()
@@ -111,152 +104,151 @@ namespace REPO_Active
 
         private void Update()
         {
-            if (_keyActivateNearest.Value.IsDown() && !_autoActivate.Value)
+            if (_activateKey != KeyCode.None && Input.GetKeyDown(_activateKey))
             {
-                ActivateNearest();
+                ActivateNearest(manual: true);
+            }
+        }
+
+        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            ResetRoundState();
+        }
+
+        private void ResetRoundState()
+        {
+            _levelReady = false;
+            _autoReadyAt = -1f;
+            _autoPrimed = false;
+            if (_autoCoroutine != null)
+            {
+                StopCoroutine(_autoCoroutine);
+                _autoCoroutine = null;
             }
 
-            _discoverTimer += Time.deltaTime;
-            float interval = GetDiscoveryInterval();
-            if (_discoverTimer >= interval)
-            {
-                _discoverTimer = 0f;
-                DiscoveryTick();
-            }
+            StateTracker.ResetForNewRound();
+            _scanner.ResetForNewRound();
+            _deferredMarking.Clear();
+            ClearPlayerCache();
+        }
 
-            if (!_autoActivate.Value)
-            {
-                return;
-            }
-
-            if (_autoReadyTime < 0f)
-            {
-                var all = _scanner.ScanAndGetAllPoints();
-                var refPos = _scanner.GetReferencePos();
-                if (all.Count > 0 && refPos != Vector3.zero)
-                {
-                    _scanner.CaptureSpawnPosIfNeeded(refPos);
-                    _autoReadyTime = Time.realtimeSinceStartup;
-                    _autoTimer = 0f;
-                    LogStatus($"auto ready: points={all.Count}, ref={FormatVector(refPos)}, waiting={AutoReadyBuffer:0}s buffer");
-                }
-                else
-                {
-                    LogStatus($"auto waiting: points={all.Count}, ref={(refPos == Vector3.zero ? "zero" : FormatVector(refPos))}", 5f);
-                }
-
-                return;
-            }
-
-            if ((Time.realtimeSinceStartup - _autoReadyTime) < AutoReadyBuffer)
+        private void HandleLevelGenerated()
+        {
+            if (_levelReady)
             {
                 return;
             }
 
+            _levelReady = true;
+            _autoReadyAt = Time.realtimeSinceStartup + AutoReadyBuffer;
+            RefreshCachedPlayers();
+            CaptureReferenceAndDiscovery();
+            ScheduleAutoActivation(AutoReadyBuffer);
+        }
+
+        private void HandleExtractionPointStarted(ExtractionPoint point)
+        {
+            if (!point)
+            {
+                return;
+            }
+
+            _scanner.RegisterPoint(point);
+            CaptureReferenceAndDiscovery();
+            if (_levelReady)
+            {
+                ScheduleAutoActivation(GetAutoReadyDelay());
+            }
+        }
+
+        private void HandleExtractionPointStateChanged(ExtractionPoint point, ExtractionPoint.State state)
+        {
+            if (!point)
+            {
+                return;
+            }
+
+            _scanner.RegisterPoint(point);
+            StateTracker.Record(point, state);
+
+            if (ExtractionPointScanner.IsBlockingState(state))
+            {
+                _scanner.MarkActivated(point);
+                return;
+            }
+
+            if (ExtractionPointScanner.IsCompletedLikeState(state))
+            {
+                _scanner.MarkActivated(point);
+            }
+
+            if (_levelReady && _autoActivate.Value && IsAutoContinueState(state))
+            {
+                ScheduleAutoActivation(Math.Max(GetAutoReadyDelay(), AutoEventDelay));
+            }
+        }
+
+        private void HandleRoomPopulationChangedEvent()
+        {
+            ClearPlayerCache();
+            RefreshCachedPlayers();
+        }
+
+        private void ScheduleAutoActivation(float delay)
+        {
+            if (!_autoActivate.Value || !_levelReady || _autoCoroutine != null)
+            {
+                return;
+            }
+
+            float effectiveDelay = Math.Max(delay, GetAutoReadyDelay());
+            _autoCoroutine = StartCoroutine(AutoActivationAfterDelay(effectiveDelay));
+        }
+
+        private IEnumerator AutoActivationAfterDelay(float delay)
+        {
+            if (delay > 0f)
+            {
+                yield return new WaitForSeconds(delay);
+            }
+
+            _autoCoroutine = null;
+            if (!_autoActivate.Value || !_levelReady)
+            {
+                yield break;
+            }
+
+            CaptureReferenceAndDiscovery();
             if (!_autoPrimed)
             {
                 PrimeFirstPointIfAlreadyActivated();
                 _autoPrimed = true;
             }
 
-            _autoTimer += Time.deltaTime;
-            if (_autoTimer >= AutoInterval)
-            {
-                _autoTimer = 0f;
-                ActivateNearest();
-            }
+            ActivateNearest(manual: false);
         }
 
-        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        private float GetAutoReadyDelay()
         {
-            _autoReadyTime = -1f;
-            _discoverReadyTime = Time.realtimeSinceStartup;
-            _autoPrimed = false;
-            _autoTimer = 0f;
-            _discoverTimer = 0f;
-            _lastTailHoldState = null;
+            if (_autoReadyAt < 0f)
+            {
+                return 0f;
+            }
 
-            StateTracker.ResetForNewRound();
-            _scanner.ResetForNewRound();
-            _deferredMarking.Clear();
-
-            _lastPlayerCount = -1;
-            _lastBaseInterval = DiscoverIntervalBase;
-            RefreshDiscoveryIntervalFromCurrentPlayerCount("scene init", invalidateCache: true);
+            float remaining = _autoReadyAt - Time.realtimeSinceStartup;
+            return remaining > 0f ? remaining : 0f;
         }
 
-        private void DiscoveryTick()
+        private void ActivateNearest(bool manual)
         {
-            var all = _scanner.ScanAndGetAllPoints();
-            var refPos = _scanner.GetReferencePos();
-            _scanner.CaptureSpawnPosIfNeeded(refPos);
-
-            if (all.Count == 0)
-            {
-                return;
-            }
-
-            if (_discoverAllPoints.Value)
-            {
-                _scanner.MarkAllDiscovered(all);
-                return;
-            }
-
-            if (_discoverReadyTime < 0f)
-            {
-                _discoverReadyTime = Time.realtimeSinceStartup;
-            }
-
-            if ((Time.realtimeSinceStartup - _discoverReadyTime) < AutoReadyBuffer)
-            {
-                return;
-            }
-
-            if (_scanner.DiscoveredCount >= all.Count)
-            {
-                return;
-            }
-
-            var allPositions = TryGetAllPlayerPositionsHost();
-            if (allPositions.Count == 0)
-            {
-                _playerListEmptyStreak++;
-                _scanner.UpdateDiscovered(refPos, DiscoverRadius);
-                return;
-            }
-
-            _playerListEmptyStreak = 0;
-            for (int i = 0; i < allPositions.Count; i++)
-            {
-                _scanner.UpdateDiscovered(allPositions[i], DiscoverRadius);
-            }
-
-            if (allPositions.Count != _lastHostPosCount)
-            {
-                _lastHostPosCount = allPositions.Count;
-            }
-        }
-
-        private void ActivateNearest()
-        {
-            var allPoints = _scanner.ScanAndGetAllPoints();
+            var allPoints = _scanner.GetAllPoints();
             if (allPoints.Count == 0)
             {
-                LogStatus("activate skipped: no extraction points found", 3f);
                 return;
             }
 
-            if (_scanner.TryGetActivatingInfo(allPoints, out var busyInfo, out var busyCount))
+            if (_scanner.TryGetActivatingInfo(allPoints, out _, out _))
             {
-                float now = Time.realtimeSinceStartup;
-                if (busyInfo != _lastBusyInfo || busyCount != _lastBusyCount || (now - _lastBusyLogTime) > 2f)
-                {
-                    _lastBusyInfo = busyInfo;
-                    _lastBusyCount = busyCount;
-                    _lastBusyLogTime = now;
-                    Logger.LogInfo($"activate blocked: busy={busyCount}, {busyInfo}");
-                }
-
                 return;
             }
 
@@ -281,25 +273,21 @@ namespace REPO_Active
 
             if (plan.Count == 0)
             {
-                LogStatus($"activate skipped: empty plan all={allPoints.Count}, eligible={eligible.Count}, discovered={_scanner.DiscoveredCount}, spawn={FormatVector(spawnPos)}", 3f);
                 return;
             }
 
             var next = plan[0];
-            if (ShouldHoldTailPointActivation(allPoints, spawnPos, plan, next, out var holdReason))
+            if (ShouldHoldTailPointActivation(allPoints, spawnPos, plan, next))
             {
-                LogStatus($"activate held: {holdReason}", 3f);
                 return;
             }
 
             try
             {
                 next.OnClick();
-                Logger.LogInfo($"activate invoked: {next.gameObject.name}#{next.GetInstanceID()}");
             }
-            catch (Exception ex)
+            catch
             {
-                Logger.LogWarning($"ExtractionPoint.OnClick failed: {ex.GetType().Name}: {ex.Message}");
                 return;
             }
 
@@ -397,24 +385,6 @@ namespace REPO_Active
                         _scanner.MarkActivated(point);
                         yield break;
                     }
-
-                    if (i == 0)
-                    {
-                        yield return null;
-                        if (!point)
-                        {
-                            yield break;
-                        }
-
-                        state = _scanner.ReadState(point);
-                        if (state.HasValue &&
-                            !ExtractionPointScanner.IsIdleLikeState(state) &&
-                            !ExtractionPointScanner.IsCompletedLikeState(state))
-                        {
-                            _scanner.MarkActivated(point);
-                            yield break;
-                        }
-                    }
                 }
             }
             finally
@@ -425,7 +395,7 @@ namespace REPO_Active
 
         private void PrimeFirstPointIfAlreadyActivated()
         {
-            var all = _scanner.ScanAndGetAllPoints();
+            var all = _scanner.GetAllPoints();
             if (all.Count == 0)
             {
                 return;
@@ -458,6 +428,36 @@ namespace REPO_Active
             if (state.HasValue && !ExtractionPointScanner.IsIdleLikeState(state))
             {
                 _scanner.MarkActivated(plan[0]);
+            }
+        }
+
+        private void CaptureReferenceAndDiscovery()
+        {
+            var refPos = _scanner.GetReferencePos();
+            _scanner.CaptureSpawnPosIfNeeded(refPos);
+
+            var all = _scanner.GetAllPoints();
+            if (_discoverAllPoints.Value)
+            {
+                _scanner.MarkAllDiscovered(all);
+                return;
+            }
+
+            RefreshCachedPlayers();
+            UpdateDiscoveredFromCachedPlayers(refPos);
+        }
+
+        private void RefreshCachedPlayers()
+        {
+            if (_discoverAllPoints.Value)
+            {
+                return;
+            }
+
+            var positions = TryGetAllPlayerPositionsHost();
+            if (positions.Count == 0)
+            {
+                return;
             }
         }
 
@@ -551,11 +551,8 @@ namespace REPO_Active
             List<ExtractionPoint> allPoints,
             Vector3 spawnPos,
             List<ExtractionPoint> plan,
-            ExtractionPoint next,
-            out string reason)
+            ExtractionPoint next)
         {
-            reason = "";
-
             if (_discoverAllPoints.Value || !next)
             {
                 return false;
@@ -572,7 +569,7 @@ namespace REPO_Active
             int tailId = tailAnchor.GetInstanceID();
             bool isTailTarget = next.GetInstanceID() == tailId;
 
-            var pendingNames = new List<string>();
+            int pendingNonTail = 0;
             for (int i = 0; i < allPoints.Count; i++)
             {
                 var point = allPoints[i];
@@ -587,54 +584,13 @@ namespace REPO_Active
                     continue;
                 }
 
-                var state = _scanner.ReadState(point);
-                if (ExtractionPointScanner.IsCompletedLikeState(state))
+                if (!ExtractionPointScanner.IsCompletedLikeState(_scanner.ReadState(point)))
                 {
-                    continue;
+                    pendingNonTail++;
                 }
-
-                pendingNames.Add($"{point.gameObject.name}#{point.GetInstanceID()}({_scanner.ReadStateName(point)})");
             }
 
-            bool shouldHold = isTailTarget && pendingNames.Count > 0;
-            _lastTailHoldState = shouldHold;
-
-            if (!shouldHold)
-            {
-                return false;
-            }
-
-            string queue = plan.Count == 0
-                ? "-"
-                : string.Join(" -> ", plan.Where(point => point).Select(point => $"{point.gameObject.name}#{point.GetInstanceID()}"));
-
-            reason = $"tail point locked, pendingOthers={pendingNames.Count}, pending=[{string.Join(", ", pendingNames)}], queue={queue}";
-            return true;
-        }
-
-        private void HandleRoomPopulationChangedEvent(string reason)
-        {
-            RefreshDiscoveryIntervalFromCurrentPlayerCount(reason, invalidateCache: true);
-        }
-
-        private void RefreshDiscoveryIntervalFromCurrentPlayerCount(string reason, bool invalidateCache)
-        {
-            int players = GetPlayerCountHost();
-            if (players < 1)
-            {
-                players = 1;
-            }
-
-            if (players != _lastPlayerCount)
-            {
-                _lastPlayerCount = players;
-                _lastBaseInterval = ComputeDiscoveryInterval(players);
-            }
-
-            if (invalidateCache)
-            {
-                ClearPlayerCache();
-            }
+            return isTailTarget && pendingNonTail > 0;
         }
 
         private void ClearPlayerCache()
@@ -644,85 +600,19 @@ namespace REPO_Active
             _playerCacheHash = 0;
         }
 
-        private float GetDiscoveryInterval()
+        private void RefreshActivateKey()
         {
-            if (_discoverAllPoints.Value)
-            {
-                return DiscoverIntervalBase;
-            }
-
-            if (_lastPlayerCount < 1)
-            {
-                RefreshDiscoveryIntervalFromCurrentPlayerCount("lazy init", invalidateCache: false);
-            }
-
-            float baseInterval = _lastBaseInterval;
-            if (_playerListEmptyStreak <= 0)
-            {
-                return baseInterval;
-            }
-
-            float multiplier = 1f + Math.Min(_playerListEmptyStreak, 10) * 0.2f;
-            float interval = baseInterval * multiplier;
-            return interval > DiscoverIntervalMax ? DiscoverIntervalMax : interval;
-        }
-
-        private static float ComputeDiscoveryInterval(int players)
-        {
-            if (players <= 3)
-            {
-                return DiscoverIntervalBase;
-            }
-
-            if (players <= 6)
-            {
-                return DiscoverInterval4To6;
-            }
-
-            if (players <= 9)
-            {
-                return DiscoverInterval7To9;
-            }
-
-            return DiscoverInterval10To12;
-        }
-
-        private static int GetPlayerCountHost()
-        {
-            try
-            {
-                if (!SemiFunc.IsMasterClientOrSingleplayer())
-                {
-                    return 1;
-                }
-
-                var players = SemiFunc.PlayerGetList();
-                return players != null && players.Count > 0 ? players.Count : 1;
-            }
-            catch
-            {
-                return 1;
-            }
-        }
-
-        internal static void NotifyRoomPopulationChanged(string reason)
-        {
-            Instance?.HandleRoomPopulationChangedEvent(reason);
-        }
-
-        internal static void NotifyExtractionPointState(ExtractionPoint point, ExtractionPoint.State state)
-        {
-            Instance?.StateTracker.Record(point, state);
+            _activateKey = ParseKeyCode(_keyActivateNearest.Value);
         }
 
         private void MigrateLegacyConfigIfNeeded(
             out bool defaultAutoActivate,
             out bool defaultDiscoverAll,
-            out KeyboardShortcut defaultShortcut)
+            out string defaultKey)
         {
             defaultAutoActivate = false;
             defaultDiscoverAll = false;
-            defaultShortcut = new KeyboardShortcut(KeyCode.F3);
+            defaultKey = "F3";
 
             string path = Config.ConfigFilePath;
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
@@ -752,22 +642,17 @@ namespace REPO_Active
                 defaultDiscoverAll = discoverValue;
             }
 
-            if (TryReadConfigValue(text, "ActivateNearestShortcut", out var shortcutText) ||
-                TryReadConfigValue(text, "ActivateNearest", out shortcutText))
+            if (TryReadConfigValue(text, "ActivateNearestKey", out var keyText) ||
+                TryReadConfigValue(text, "ActivateNearestShortcut", out keyText) ||
+                TryReadConfigValue(text, "ActivateNearest", out keyText))
             {
-                try
-                {
-                    defaultShortcut = KeyboardShortcut.Deserialize(shortcutText);
-                }
-                catch
-                {
-                    defaultShortcut = new KeyboardShortcut(KeyCode.F3);
-                }
+                defaultKey = SanitizeKeyName(ExtractPrimaryKeyName(keyText));
             }
 
             bool needsCleanRewrite =
+                text.IndexOf("ActivateNearestShortcut", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 text.IndexOf("Setting type: KeyCode", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                text.IndexOf("Acceptable values:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                text.IndexOf("Setting type: KeyboardShortcut", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 text.IndexOf("BuildQueueAndRun", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 text.IndexOf("EnforceHostAuthority", StringComparison.OrdinalIgnoreCase) >= 0;
 
@@ -791,9 +676,8 @@ namespace REPO_Active
                 File.Delete(path);
                 Config.Reload();
             }
-            catch (Exception ex)
+            catch
             {
-                Logger.LogWarning($"legacy config cleanup failed: {ex.GetType().Name}: {ex.Message}");
             }
         }
 
@@ -831,22 +715,104 @@ namespace REPO_Active
             return false;
         }
 
-        private void LogStatus(string message, float cooldownSeconds = 2f)
+        private static bool IsAutoContinueState(ExtractionPoint.State state)
         {
-            float now = Time.realtimeSinceStartup;
-            if (message == _lastStatusLog && now - _lastStatusLogTime < cooldownSeconds)
-            {
-                return;
-            }
-
-            _lastStatusLog = message;
-            _lastStatusLogTime = now;
-            Logger.LogInfo(message);
+            return state == ExtractionPoint.State.None ||
+                   state == ExtractionPoint.State.Idle ||
+                   state == ExtractionPoint.State.Success ||
+                   state == ExtractionPoint.State.Complete ||
+                   state == ExtractionPoint.State.Cancel;
         }
 
-        private static string FormatVector(Vector3 value)
+        private static KeyCode ParseKeyCode(string value)
         {
-            return $"({value.x:0.0},{value.y:0.0},{value.z:0.0})";
+            if (Enum.TryParse(value, ignoreCase: true, out KeyCode key))
+            {
+                return key;
+            }
+
+            return KeyCode.F3;
+        }
+
+        private static string SanitizeKeyName(string value)
+        {
+            string primary = ExtractPrimaryKeyName(value);
+            for (int i = 0; i < KeyOptions.Length; i++)
+            {
+                if (string.Equals(KeyOptions[i], primary, StringComparison.OrdinalIgnoreCase))
+                {
+                    return KeyOptions[i];
+                }
+            }
+
+            return "F3";
+        }
+
+        private static string ExtractPrimaryKeyName(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return "F3";
+            }
+
+            string trimmed = value.Trim();
+            int plus = trimmed.IndexOf('+');
+            if (plus >= 0)
+            {
+                trimmed = trimmed.Substring(0, plus).Trim();
+            }
+
+            int comma = trimmed.IndexOf(',');
+            if (comma >= 0)
+            {
+                trimmed = trimmed.Substring(0, comma).Trim();
+            }
+
+            return trimmed.Length == 0 ? "F3" : trimmed;
+        }
+
+        private static string[] BuildKeyOptions()
+        {
+            var values = new List<string> { "None" };
+            for (int i = 1; i <= 12; i++)
+            {
+                values.Add("F" + i);
+            }
+
+            for (char c = 'A'; c <= 'Z'; c++)
+            {
+                values.Add(c.ToString());
+            }
+
+            for (int i = 0; i <= 9; i++)
+            {
+                values.Add("Alpha" + i);
+            }
+
+            values.Add("Mouse3");
+            values.Add("Mouse4");
+            values.Add("Mouse5");
+            return values.ToArray();
+        }
+
+        internal static void NotifyRoomPopulationChanged()
+        {
+            Instance?.HandleRoomPopulationChangedEvent();
+        }
+
+        internal static void NotifyLevelGenerated()
+        {
+            Instance?.HandleLevelGenerated();
+        }
+
+        internal static void NotifyExtractionPointStarted(ExtractionPoint point)
+        {
+            Instance?.HandleExtractionPointStarted(point);
+        }
+
+        internal static void NotifyExtractionPointState(ExtractionPoint point, ExtractionPoint.State state)
+        {
+            Instance?.HandleExtractionPointStateChanged(point, state);
         }
     }
 
@@ -855,7 +821,7 @@ namespace REPO_Active
     {
         private static void Postfix()
         {
-            Plugin.NotifyRoomPopulationChanged("player entered");
+            Plugin.NotifyRoomPopulationChanged();
         }
     }
 
@@ -864,7 +830,34 @@ namespace REPO_Active
     {
         private static void Postfix()
         {
-            Plugin.NotifyRoomPopulationChanged("player left");
+            Plugin.NotifyRoomPopulationChanged();
+        }
+    }
+
+    [HarmonyPatch(typeof(LevelGenerator), "GenerateDone")]
+    internal static class LevelGeneratorGenerateDonePatch
+    {
+        private static void Postfix()
+        {
+            Plugin.NotifyLevelGenerated();
+        }
+    }
+
+    [HarmonyPatch(typeof(SemiFunc), nameof(SemiFunc.OnLevelGenDone))]
+    internal static class SemiFuncOnLevelGenDonePatch
+    {
+        private static void Postfix()
+        {
+            Plugin.NotifyLevelGenerated();
+        }
+    }
+
+    [HarmonyPatch(typeof(ExtractionPoint), "Start")]
+    internal static class ExtractionPointStartPatch
+    {
+        private static void Postfix(ExtractionPoint __instance)
+        {
+            Plugin.NotifyExtractionPointStarted(__instance);
         }
     }
 

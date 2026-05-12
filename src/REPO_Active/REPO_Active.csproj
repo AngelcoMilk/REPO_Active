@@ -4,7 +4,7 @@
     <TargetFramework>netstandard2.1</TargetFramework>
     <LangVersion>latest</LangVersion>
     <AssemblyName>REPO_Active</AssemblyName>
-    <Version>5.2.2</Version>
+    <Version>5.2.3</Version>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 

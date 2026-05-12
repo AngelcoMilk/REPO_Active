@@ -1,7 +1,7 @@
 # REPO_Active 技术说明（当前版本）
 
-适用版本：`5.2.2`
-源码根目录：`C:\Users\Home\Documents\GitHub\REPO_Active`
+适用版本：`5.2.3`
+源码根目录：本仓库根目录
 
 ## 1. 目标与边界
 
@@ -23,8 +23,8 @@
 - `src/REPO_Active/Runtime/ExtractionPointStateTracker.cs`
 
 职责划分：
-- `Plugin.cs`：配置读取、生命周期、轮询驱动、激活流程编排。
-- `ExtractionPointScanner.cs`：提取点扫描、状态读取、发现集合维护、路径规划、激活态检测。
+- `Plugin.cs`：配置读取、生命周期、事件调度、激活流程编排。
+- `ExtractionPointScanner.cs`：提取点注册、状态读取、发现集合维护、路径规划、激活态检测。
 - `ExtractionPointStateTracker.cs`：通过 `ExtractionPoint.StateSetRPC` patch 追踪状态；仅在缺少初始状态时集中读取一次 `currentState` 作为兼容 fallback。
 
 ## 3. 配置项（当前）
@@ -33,9 +33,9 @@
 
 - `AutoActivate`（bool）
   - `false`：手动模式，仅 `F3` 触发。
-  - `true`：自动模式，按定时流程触发。
-- `ActivateNearestShortcut`（KeyboardShortcut）
-  - 手动激活快捷键，默认 `F3`，避免旧 `KeyCode` 配置写入过长枚举导致配置界面卡住。
+  - `true`：自动模式，按提取点注册、关卡生成完成、状态变化等事件触发。
+- `ActivateNearestKey`（string）
+  - 手动激活按键，默认 `F3`，使用 REPOConfig 支持的字符串选项。
 - `DiscoverAllPoints`（bool）
   - `true`：全图默认已发现。
   - `false`：按玩家位置半径动态发现。
@@ -45,19 +45,18 @@
 ### 4.1 场景加载
 
 `OnSceneLoaded` 会重置本局状态：
-- 自动模式计时器与准备时间。
-- 发现计时器。
+- 自动模式准备时间与事件调度状态。
+- 已注册提取点缓存。
 - 扫描器内部缓存（发现集合、激活标记、路径缓存、anchor 缓存）。
-- 玩家缓存与发现轮询间隔基线。
+- 玩家缓存与事件触发的发现更新。
 
 ### 4.2 发现流程
 
-每个发现轮询周期执行 `DiscoveryTick()`：
-- 先刷新提取点列表。
-- `DiscoverAllPoints=true`：直接把所有点加入已发现集合。
+发现更新不再高频轮询，而是在提取点注册、关卡生成完成、玩家列表变化和手动/自动激活前执行：
+- `DiscoverAllPoints=true`：直接把所有已注册点加入已发现集合。
 - `DiscoverAllPoints=false`：
   - 先等待 `AUTO_READY_BUFFER=30s` 缓冲，避免进局早期数据不稳定。
-  - 优先使用主机可见的所有玩家位置做半径发现。
+  - 优先使用主机缓存的玩家位置做半径发现。
   - 如果玩家列表暂时取不到，退化为参考位置（相机/本地玩家）发现。
 
 半径：`DISCOVER_RADIUS=20m`。
@@ -65,17 +64,17 @@
 ### 4.3 激活流程（手动与自动共用）
 
 统一由 `ActivateNearest()` 执行：
-1. 刷新提取点。
-2. 若任意点处于“激活中”（非 Idle 且非 Completed-like），直接阻塞新激活。
+1. 读取已注册的提取点缓存。
+2. 若任意点处于 `Active/Warning/Extracting/Surplus/TaxReturn`，直接阻塞新激活。
 3. 计算参考位置并捕获 spawn 锚点。
 4. 根据发现模式形成候选集。
 5. 规划队列并选取首个目标。
 6. 调用 `ExtractionPoint.OnClick()`。
 7. 若状态已进入非 Idle/非 Complete，立即 `MarkActivated`；否则延迟短轮询补标记。
 
-自动模式只是在 `Update()` 中按间隔调用这条链路：
+自动模式不再由 `Update()` 周期调用：
 - 先满足 30 秒准备缓冲。
-- `AUTO_INTERVAL=5s` 周期触发。
+- 仅由关卡生成完成、提取点注册、提取点状态变化等事件调度下一次激活。
 
 ## 5. 排序与规划规则
 
@@ -138,7 +137,7 @@
 `Plugin.TryGetAllPlayerPositionsHost()`：
 - 对玩家列表做哈希，列表变化时重建缓存。
 - 保存最近坐标用于发现降级链路。
-- 当玩家进出房间（Harmony patch `NetworkManager.OnPlayerEnteredRoom/OnPlayerLeftRoom`）时刷新间隔与缓存。
+- 当玩家进出房间（Harmony patch `NetworkManager.OnPlayerEnteredRoom/OnPlayerLeftRoom`）时只刷新玩家缓存。
 
 ## 8. 打包与发布
 
@@ -150,8 +149,7 @@
 - `dotnet build -c Release`。
 - 校验 `README.md` 必须是 UTF-8 无 BOM。
 - 输出 zip：
-  - 测试版：`REPO_Active_test_r2modman.zip`
-  - 发行版：`REPO_Active_release_r2modman.zip`
+  - 发行版：`REPO_Active_v5.2.3_r2modman.zip`
 
 打包内容：
 - `manifest.json`
