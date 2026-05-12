@@ -1,4 +1,4 @@
-# REPO_Active v5.1.0
+# REPO_Active v5.2.1
 
 This is a practical mod for REPO:
 it supports **remote extraction-point activation** using the game's native `ExtractionPoint.OnClick()` logic.
@@ -44,7 +44,6 @@ Config file: `BepInEx\\config\\angelcomilk.repo_active.cfg`
 - `AutoActivate`: whether to auto-activate extraction points.
 - `ActivateNearest`: manual activation hotkey (default `F3`).
 - `DiscoverAllPoints`: whether all extraction points are discovered by default.
-- `EnforceHostAuthority`: in multiplayer, whether only the host can activate extraction points. If disabled, remote activation can be used in other players' rooms (not the original design intent, but potentially useful). In that case, non-host cannot use other players' positions to mark discovery.
 
 ## Installation (r2modman)
 1. Import the zip.
@@ -55,7 +54,7 @@ Config file: `BepInEx\\config\\angelcomilk.repo_active.cfg`
 **AngelcoMilk - Angel Cotton**
 ---
 
-# REPO_Active v5.1.0
+# REPO_Active v5.2.1
 
 这是一个给 REPO 用的实用模组：
 它可以**远程激活提取点**，而且走的是游戏原生 `ExtractionPoint.OnClick()` 逻辑。
@@ -101,7 +100,6 @@ Config file: `BepInEx\\config\\angelcomilk.repo_active.cfg`
 - `AutoActivate`：是否自动激活提取点。
 - `ActivateNearest`：手动激活按键（默认 `F3`）。
 - `DiscoverAllPoints`：是否默认全图提取点已发现。
-- `EnforceHostAuthority`：多人下是否仅主机可执行提取点激活 —— 如果关闭该限制，将可以在他人的房间中远程激活提取点 —— 这个不是本意，不过有可能带来帮助就保留了（当然，在这个情况下不能使用其他玩家的位置标记提取点是否发现 —— 因为你不是主机~）。
 
 ## 安装（r2modman）
 1. 导入 zip。

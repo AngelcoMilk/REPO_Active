@@ -2,14 +2,12 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
+using REPO_Active.Runtime;
 using UnityEngine;
 using UnityEngine.SceneManagement;
-using REPO_Active.Runtime;
-using REPO_Active.Reflection;
 
 namespace REPO_Active
 {
@@ -18,85 +16,97 @@ namespace REPO_Active
     {
         public const string PluginGuid = "angelcomilk.repo_active";
         public const string PluginName = "REPO_Active";
-        public const string PluginVersion = "5.1.0";
+        public const string PluginVersion = "5.2.1";
 
-        // ---- config ----
+        private const float RescanCooldown = 0.6f;
+        private const bool SkipActivated = true;
+        private const float AutoInterval = 5.0f;
+        private const float DiscoverIntervalBase = 0.5f;
+        private const float DiscoverInterval4To6 = 1.0f;
+        private const float DiscoverInterval7To9 = 1.5f;
+        private const float DiscoverInterval10To12 = 2.0f;
+        private const float DiscoverIntervalMax = 3.0f;
+        private const float DiscoverRadius = 20f;
+        private const float AutoReadyBuffer = 30f;
+
         private ConfigEntry<bool> _autoActivate = null!;
         private ConfigEntry<KeyCode> _keyActivateNearest = null!;
         private ConfigEntry<bool> _discoverAllPoints = null!;
-        private ExtractionPointScanner _scanner = null!;
-        private ExtractionPointInvoker _invoker = null!;
-        private Harmony? _harmony;
-        private static Plugin? _instance;
 
-        private float _autoTimer = 0f;
-        private float _discoverTimer = 0f;
+        private readonly HashSet<int> _deferredMarking = new HashSet<int>();
+        private readonly List<PlayerAvatar> _playerCache = new List<PlayerAvatar>();
+        private readonly List<Vector3> _playerLastPos = new List<Vector3>();
+
+        private ExtractionPointScanner _scanner = null!;
+        private Harmony? _harmony;
+
+        private float _autoTimer;
+        private float _discoverTimer;
         private float _autoReadyTime = -1f;
         private float _discoverReadyTime = -1f;
-        private bool _autoPrimed = false;
-        private readonly HashSet<int> _deferredMarking = new HashSet<int>();
-
-        // Player list cache for discovery (host only)
-        private readonly List<Component> _playerCache = new List<Component>();
-        private readonly List<Vector3> _playerLastPos = new List<Vector3>();
-        private int _playerCacheHash = 0;
-        private int _playerListEmptyStreak = 0;
+        private bool _autoPrimed;
+        private int _playerCacheHash;
+        private int _playerListEmptyStreak;
         private int _lastPlayerCount = -1;
-        private float _lastBaseInterval = DISCOVER_INTERVAL_BASE;
+        private float _lastBaseInterval = DiscoverIntervalBase;
         private int _lastHostPosCount = -1;
-        private int _lastAutoBufferBucket = int.MinValue;
-        private int _lastDiscoverBufferBucket = int.MinValue;
         private string _lastBusyInfo = "";
         private int _lastBusyCount = -1;
         private float _lastBusyLogTime = -1f;
-        private bool? _lastTailHoldState = null;
+        private bool? _lastTailHoldState;
 
-        private const float RESCAN_COOLDOWN = 0.6f;
-        private const bool SKIP_ACTIVATED = true;
-        private const float AUTO_INTERVAL = 5.0f;
-        private const float DISCOVER_INTERVAL_BASE = 0.5f;
-        private const float DISCOVER_INTERVAL_4_6 = 1.0f;
-        private const float DISCOVER_INTERVAL_7_9 = 1.5f;
-        private const float DISCOVER_INTERVAL_10_12 = 2.0f;
-        private const float DISCOVER_INTERVAL_MAX = 3.0f;
-        private const float DISCOVER_RADIUS = 20f;
-        private const float AUTO_READY_BUFFER = 30f;
+        internal static Plugin? Instance { get; private set; }
+
+        internal ExtractionPointStateTracker StateTracker { get; } = new ExtractionPointStateTracker();
 
         private void Awake()
         {
             _autoActivate = Config.Bind("Auto", "AutoActivate", false, "Auto activate when idle.");
-            _keyActivateNearest = Config.Bind("Keybinds", "ActivateNearest", KeyCode.F3, "Press to activate next extraction point (uses OnClick via reflection)." );
+            _keyActivateNearest = Config.Bind("Keybinds", "ActivateNearest", KeyCode.F3, "Press to activate next extraction point.");
             _discoverAllPoints = Config.Bind("Discovery", "DiscoverAllPoints", false, "If true, treat all extraction points as discovered.");
 
-            _invoker = new ExtractionPointInvoker();
-            _scanner = new ExtractionPointScanner(RESCAN_COOLDOWN);
-            _instance = this;
-            InstallEventPatches();
+            Instance = this;
+            _scanner = new ExtractionPointScanner(RescanCooldown, StateTracker);
+
+            _harmony = new Harmony(PluginGuid);
+            _harmony.PatchAll(typeof(Plugin).Assembly);
 
             SceneManager.sceneLoaded += OnSceneLoaded;
+            Logger.LogInfo($"{PluginName} {PluginVersion} loaded for the strong-typed REPO build.");
         }
 
         private void OnDestroy()
         {
-            try { SceneManager.sceneLoaded -= OnSceneLoaded; } catch { }
-            try { UninstallEventPatches(); } catch { }
-            if (ReferenceEquals(_instance, this)) _instance = null;
-        }
+            try
+            {
+                SceneManager.sceneLoaded -= OnSceneLoaded;
+            }
+            catch
+            {
+            }
 
+            try
+            {
+                _harmony?.UnpatchSelf();
+                _harmony = null;
+            }
+            catch
+            {
+            }
+
+            if (ReferenceEquals(Instance, this))
+            {
+                Instance = null;
+            }
+        }
 
         private void Update()
         {
-
-            // manual
-            // [VERIFY] UnityEngine.Input.GetKeyDown (UnityEngine.InputLegacyModule).
             if (Input.GetKeyDown(_keyActivateNearest.Value) && !_autoActivate.Value)
             {
                 ActivateNearest();
             }
 
-
-            // discovery polling
-            // [VERIFY] UnityEngine.Time.deltaTime (UnityEngine.CoreModule).
             _discoverTimer += Time.deltaTime;
             float interval = GetDiscoveryInterval();
             if (_discoverTimer >= interval)
@@ -105,84 +115,68 @@ namespace REPO_Active
                 DiscoveryTick();
             }
 
-            // auto mode
-            if (_autoActivate.Value)
+            if (!_autoActivate.Value)
             {
-                if (_autoReadyTime < 0f)
-                {
-                    if (_scanner.EnsureReady())
-                    {
-                        var all = _scanner.ScanAndGetAllPoints();
-                        var refPos = _scanner.GetReferencePos();
-                        // [VERIFY] UnityEngine.Time.realtimeSinceStartup (UnityEngine.CoreModule).
-                        if (all.Count > 0 && refPos != Vector3.zero)
-                        {
-                            _scanner.CaptureSpawnPosIfNeeded(refPos);
-                            _autoReadyTime = Time.realtimeSinceStartup;
-                            _autoTimer = 0f;
-                        }
-                    }
-                }
-                else
-                {
-                    // wait for services-ready buffer before allowing auto activation
-                    if ((Time.realtimeSinceStartup - _autoReadyTime) >= AUTO_READY_BUFFER)
-                    {
-                        _lastAutoBufferBucket = int.MinValue;
-                        // Prime: if the first planned point already activated, mark it once
-                        if (!_autoPrimed)
-                        {
-                            PrimeFirstPointIfAlreadyActivated();
-                            _autoPrimed = true;
-                        }
+                return;
+            }
 
-                        _autoTimer += Time.deltaTime;
-                        if (_autoTimer >= AUTO_INTERVAL)
-                        {
-                            _autoTimer = 0f;
-                            AutoActivateIfIdle();
-                        }
-                    }
-                    else
-                    {
-                        var left = AUTO_READY_BUFFER - (Time.realtimeSinceStartup - _autoReadyTime);
-                        if (left > 0f)
-                        {
-                            int bucket = (int)(left / 5f);
-                            if (bucket != _lastAutoBufferBucket)
-                            {
-                                _lastAutoBufferBucket = bucket;
-                            }
-                        }
-                    }
+            if (_autoReadyTime < 0f)
+            {
+                var all = _scanner.ScanAndGetAllPoints();
+                var refPos = _scanner.GetReferencePos();
+                if (all.Count > 0 && refPos != Vector3.zero)
+                {
+                    _scanner.CaptureSpawnPosIfNeeded(refPos);
+                    _autoReadyTime = Time.realtimeSinceStartup;
+                    _autoTimer = 0f;
                 }
+
+                return;
+            }
+
+            if ((Time.realtimeSinceStartup - _autoReadyTime) < AutoReadyBuffer)
+            {
+                return;
+            }
+
+            if (!_autoPrimed)
+            {
+                PrimeFirstPointIfAlreadyActivated();
+                _autoPrimed = true;
+            }
+
+            _autoTimer += Time.deltaTime;
+            if (_autoTimer >= AutoInterval)
+            {
+                _autoTimer = 0f;
+                ActivateNearest();
             }
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
-            // Reset per-round timers so auto mode re-enters its buffer on every map load
-            // [VERIFY] UnityEngine.SceneManagement.SceneManager/Scene (UnityEngine.CoreModule).
             _autoReadyTime = -1f;
             _discoverReadyTime = Time.realtimeSinceStartup;
             _autoPrimed = false;
             _autoTimer = 0f;
             _discoverTimer = 0f;
             _lastTailHoldState = null;
+
+            StateTracker.ResetForNewRound();
             _scanner.ResetForNewRound();
+            _deferredMarking.Clear();
+
             _lastPlayerCount = -1;
-            _lastBaseInterval = DISCOVER_INTERVAL_BASE;
+            _lastBaseInterval = DiscoverIntervalBase;
             RefreshDiscoveryIntervalFromCurrentPlayerCount("scene init", invalidateCache: true);
         }
 
         private void DiscoveryTick()
         {
-            if (!_scanner.EnsureReady()) return;
-
-            // Always rescan on discovery tick to keep cache fresh even while points are activating
             var all = _scanner.ScanAndGetAllPoints();
             var refPos = _scanner.GetReferencePos();
             _scanner.CaptureSpawnPosIfNeeded(refPos);
+
             if (all.Count == 0)
             {
                 return;
@@ -191,225 +185,218 @@ namespace REPO_Active
             if (_discoverAllPoints.Value)
             {
                 _scanner.MarkAllDiscovered(all);
+                return;
             }
-            else
+
+            if (_discoverReadyTime < 0f)
             {
-                // Bind discovery to the same services-ready buffer; avoid early empty lists.
-                if (_discoverReadyTime < 0f) _discoverReadyTime = Time.realtimeSinceStartup;
-                if ((Time.realtimeSinceStartup - _discoverReadyTime) < AUTO_READY_BUFFER)
-                {
-                    var left = AUTO_READY_BUFFER - (Time.realtimeSinceStartup - _discoverReadyTime);
-                    int bucket = (int)(left / 5f);
-                    if (bucket != _lastDiscoverBufferBucket)
-                    {
-                        _lastDiscoverBufferBucket = bucket;
-                    }
-                    return;
-                }
-                _lastDiscoverBufferBucket = int.MinValue;
-
-                if (_scanner.DiscoveredCount >= all.Count)
-                {
-                    return;
-                }
-                var allPos = TryGetAllPlayerPositionsHost();
-                if (allPos.Count == 0)
-                {
-                    _playerListEmptyStreak++;
-                    _scanner.UpdateDiscovered(refPos, DISCOVER_RADIUS);
-                }
-                else
-                {
-                    _playerListEmptyStreak = 0;
-                    for (int i = 0; i < allPos.Count; i++)
-                    {
-                        _scanner.UpdateDiscovered(allPos[i], DISCOVER_RADIUS);
-                    }
-
-                    if (allPos.Count != _lastHostPosCount)
-                    {
-                        _lastHostPosCount = allPos.Count;
-                    }
-                }
+                _discoverReadyTime = Time.realtimeSinceStartup;
             }
-        }
 
-        private void AutoActivateIfIdle()
-        {
-            if (!_scanner.EnsureReady())
+            if ((Time.realtimeSinceStartup - _discoverReadyTime) < AutoReadyBuffer)
             {
                 return;
             }
-            ActivateNearest();
+
+            if (_scanner.DiscoveredCount >= all.Count)
+            {
+                return;
+            }
+
+            var allPositions = TryGetAllPlayerPositionsHost();
+            if (allPositions.Count == 0)
+            {
+                _playerListEmptyStreak++;
+                _scanner.UpdateDiscovered(refPos, DiscoverRadius);
+                return;
+            }
+
+            _playerListEmptyStreak = 0;
+            for (int i = 0; i < allPositions.Count; i++)
+            {
+                _scanner.UpdateDiscovered(allPositions[i], DiscoverRadius);
+            }
+
+            if (allPositions.Count != _lastHostPosCount)
+            {
+                _lastHostPosCount = allPositions.Count;
+            }
         }
 
         private void ActivateNearest()
         {
-            if (!_scanner.EnsureReady())
-            {
-                return;
-            }
-
             var allPoints = _scanner.ScanAndGetAllPoints();
-
-            // 1) Block activation while any extraction point is currently activating.
-            string busyInfo;
-            int busyCount;
-            if (_scanner.TryGetActivatingInfo(allPoints, out busyInfo, out busyCount))
+            if (allPoints.Count == 0)
             {
-                var now = Time.realtimeSinceStartup;
-                    if (busyInfo != _lastBusyInfo || busyCount != _lastBusyCount || (now - _lastBusyLogTime) > 2f)
-                    {
-                        _lastBusyInfo = busyInfo;
-                        _lastBusyCount = busyCount;
-                        _lastBusyLogTime = now;
-                    }
                 return;
             }
 
-            // 2) spawnPos + startPos
+            if (_scanner.TryGetActivatingInfo(allPoints, out var busyInfo, out var busyCount))
+            {
+                float now = Time.realtimeSinceStartup;
+                if (busyInfo != _lastBusyInfo || busyCount != _lastBusyCount || (now - _lastBusyLogTime) > 2f)
+                {
+                    _lastBusyInfo = busyInfo;
+                    _lastBusyCount = busyCount;
+                    _lastBusyLogTime = now;
+                }
+
+                return;
+            }
+
             var startPos = _scanner.GetReferencePos();
             _scanner.CaptureSpawnPosIfNeeded(startPos);
             var spawnPos = _scanner.GetSpawnPos();
 
-            // discovery filter
             if (_discoverAllPoints.Value)
-                _scanner.MarkAllDiscovered(allPoints);
-            else
-                UpdateDiscoveredFromCachedPlayers(startPos);
-
-            var eligible = _discoverAllPoints.Value ? allPoints : _scanner.FilterDiscovered(allPoints);
-
-            // 4) Build the candidate plan list.
-            var planInput = eligible;
-            if (!_discoverAllPoints.Value
-                && eligible.Count > 1
-                && _scanner.TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out _, out var globalTail)
-                && globalTail != null)
             {
-                int tailId = globalTail.GetInstanceID();
-                bool hasTail = false;
-                for (int i = 0; i < eligible.Count; i++)
-                {
-                    if (eligible[i] && eligible[i].GetInstanceID() == tailId)
-                    {
-                        hasTail = true;
-                        break;
-                    }
-                }
-
-                if (hasTail)
-                {
-                    var filtered = new List<Component>();
-                    int unfinishedNonTail = 0;
-                    for (int i = 0; i < eligible.Count; i++)
-                    {
-                        var ep = eligible[i];
-                        if (!ep) continue;
-                        if (ep.GetInstanceID() == tailId) continue;
-
-                        filtered.Add(ep);
-
-                        var st = _scanner.ReadStateName(ep);
-                        if (!ExtractionPointScanner.IsCompletedLikeState(st))
-                            unfinishedNonTail++;
-                    }
-
-                    // Only filter out tail when there is at least one unfinished non-tail point.
-                    // If all non-tail points are completed, tail must be allowed into the plan.
-                    if (filtered.Count > 0 && unfinishedNonTail > 0)
-                    {
-                        planInput = filtered;
-                    }
-                }
+                _scanner.MarkAllDiscovered(allPoints);
+            }
+            else
+            {
+                UpdateDiscoveredFromCachedPlayers(startPos);
             }
 
+            var eligible = _discoverAllPoints.Value ? allPoints : _scanner.FilterDiscovered(allPoints);
+            var planInput = BuildPlanInputWithoutEarlyTail(allPoints, eligible, spawnPos);
             var plan = _discoverAllPoints.Value
-                ? _scanner.BuildPlanDiscoverAllFixedAnchors(allPoints, spawnPos, skipActivated: SKIP_ACTIVATED)
-                : _scanner.BuildStage1PlannedList(planInput, spawnPos, skipActivated: SKIP_ACTIVATED);
+                ? _scanner.BuildPlanDiscoverAllFixedAnchors(allPoints, spawnPos, SkipActivated)
+                : _scanner.BuildStage1PlannedList(planInput, spawnPos, SkipActivated);
+
             if (plan.Count == 0)
             {
                 return;
             }
 
             var next = plan[0];
-            if (!_discoverAllPoints.Value && ShouldHoldTailPointActivation(allPoints, spawnPos, plan, next, out _))
+            if (ShouldHoldTailPointActivation(allPoints, spawnPos, plan, next, out _))
             {
                 return;
             }
 
-
-            var invokeOk = _invoker.InvokeOnClick(next);
-
-            if (invokeOk)
+            try
             {
-                var st = _scanner.ReadStateName(next);
-                if (!string.IsNullOrEmpty(st) &&
-                    !ExtractionPointScanner.IsIdleLikeState(st) &&
-                    !ExtractionPointScanner.IsCompletedLikeState(st))
-                {
-                    _scanner.MarkActivated(next);
-                }
-                else
-                {
-                    TryDeferredMarkActivated(next);
-                }
+                next.OnClick();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"ExtractionPoint.OnClick failed: {ex.GetType().Name}");
+                return;
+            }
+
+            var state = _scanner.ReadState(next);
+            if (state.HasValue &&
+                !ExtractionPointScanner.IsIdleLikeState(state) &&
+                !ExtractionPointScanner.IsCompletedLikeState(state))
+            {
+                _scanner.MarkActivated(next);
+            }
+            else
+            {
+                TryDeferredMarkActivated(next);
             }
         }
 
-        private void TryDeferredMarkActivated(Component ep)
+        private List<ExtractionPoint> BuildPlanInputWithoutEarlyTail(
+            List<ExtractionPoint> allPoints,
+            List<ExtractionPoint> eligible,
+            Vector3 spawnPos)
         {
-            if (ep == null) return;
-            int id = ep.GetInstanceID();
-            if (!_deferredMarking.Add(id))
+            if (_discoverAllPoints.Value ||
+                eligible.Count <= 1 ||
+                !_scanner.TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out _, out var globalTail) ||
+                globalTail == null ||
+                !globalTail)
+            {
+                return eligible;
+            }
+
+            int tailId = globalTail.GetInstanceID();
+            bool hasTail = eligible.Any(point => point && point.GetInstanceID() == tailId);
+            if (!hasTail)
+            {
+                return eligible;
+            }
+
+            var filtered = new List<ExtractionPoint>();
+            int unfinishedNonTail = 0;
+            for (int i = 0; i < eligible.Count; i++)
+            {
+                var point = eligible[i];
+                if (!point || point.GetInstanceID() == tailId)
+                {
+                    continue;
+                }
+
+                filtered.Add(point);
+                if (!ExtractionPointScanner.IsCompletedLikeState(_scanner.ReadState(point)))
+                {
+                    unfinishedNonTail++;
+                }
+            }
+
+            return filtered.Count > 0 && unfinishedNonTail > 0 ? filtered : eligible;
+        }
+
+        private void TryDeferredMarkActivated(ExtractionPoint point)
+        {
+            if (!point)
             {
                 return;
             }
 
-            StartCoroutine(DeferredMarkActivated(ep, id));
+            int id = point.GetInstanceID();
+            if (_deferredMarking.Add(id))
+            {
+                StartCoroutine(DeferredMarkActivated(point, id));
+            }
         }
 
-        private IEnumerator DeferredMarkActivated(Component ep, int id)
+        private IEnumerator DeferredMarkActivated(ExtractionPoint point, int id)
         {
             try
             {
-                if (ep == null) yield break;
+                if (!point)
+                {
+                    yield break;
+                }
 
                 float[] waits = { 0.15f, 0.25f, 0.35f, 0.35f, 0.40f };
-                string lastState = "";
-
                 for (int i = 0; i < waits.Length; i++)
                 {
-                    if (waits[i] > 0f) yield return new WaitForSeconds(waits[i]);
-                    if (ep == null) yield break;
-
-                    var st = _scanner.ReadStateName(ep);
-                    lastState = st;
-
-                    if (!string.IsNullOrEmpty(st) &&
-                        !ExtractionPointScanner.IsIdleLikeState(st) &&
-                        !ExtractionPointScanner.IsCompletedLikeState(st))
+                    yield return new WaitForSeconds(waits[i]);
+                    if (!point)
                     {
-                        _scanner.MarkActivated(ep);
+                        yield break;
+                    }
+
+                    var state = _scanner.ReadState(point);
+                    if (state.HasValue &&
+                        !ExtractionPointScanner.IsIdleLikeState(state) &&
+                        !ExtractionPointScanner.IsCompletedLikeState(state))
+                    {
+                        _scanner.MarkActivated(point);
                         yield break;
                     }
 
                     if (i == 0)
                     {
                         yield return null;
-                        if (ep == null) yield break;
-                        var st2 = _scanner.ReadStateName(ep);
-                        lastState = string.IsNullOrEmpty(st2) ? lastState : st2;
-                        if (!string.IsNullOrEmpty(st2) &&
-                            !ExtractionPointScanner.IsIdleLikeState(st2) &&
-                            !ExtractionPointScanner.IsCompletedLikeState(st2))
+                        if (!point)
                         {
-                            _scanner.MarkActivated(ep);
+                            yield break;
+                        }
+
+                        state = _scanner.ReadState(point);
+                        if (state.HasValue &&
+                            !ExtractionPointScanner.IsIdleLikeState(state) &&
+                            !ExtractionPointScanner.IsCompletedLikeState(state))
+                        {
+                            _scanner.MarkActivated(point);
                             yield break;
                         }
                     }
                 }
-
             }
             finally
             {
@@ -420,95 +407,83 @@ namespace REPO_Active
         private void PrimeFirstPointIfAlreadyActivated()
         {
             var all = _scanner.ScanAndGetAllPoints();
-            if (all.Count == 0) return;
+            if (all.Count == 0)
+            {
+                return;
+            }
 
             var refPos = _scanner.GetReferencePos();
             _scanner.CaptureSpawnPosIfNeeded(refPos);
 
             if (_discoverAllPoints.Value)
+            {
                 _scanner.MarkAllDiscovered(all);
+            }
             else
-                _scanner.UpdateDiscovered(refPos, DISCOVER_RADIUS);
+            {
+                _scanner.UpdateDiscovered(refPos, DiscoverRadius);
+            }
 
             var eligible = _discoverAllPoints.Value ? all : _scanner.FilterDiscovered(all);
             var spawnPos = _scanner.GetSpawnPos();
             var plan = _discoverAllPoints.Value
-                ? _scanner.BuildPlanDiscoverAllFixedAnchors(all, spawnPos, skipActivated: SKIP_ACTIVATED)
-                : _scanner.BuildStage1PlannedList(eligible, spawnPos, skipActivated: SKIP_ACTIVATED);
-            if (plan.Count == 0) return;
+                ? _scanner.BuildPlanDiscoverAllFixedAnchors(all, spawnPos, SkipActivated)
+                : _scanner.BuildStage1PlannedList(eligible, spawnPos, SkipActivated);
 
-            var first = plan[0];
-            var state = _scanner.ReadStateName(first);
-            if (!string.IsNullOrEmpty(state) && !ExtractionPointScanner.IsIdleLikeState(state))
+            if (plan.Count == 0)
             {
-                _scanner.MarkActivated(first);
+                return;
+            }
+
+            var state = _scanner.ReadState(plan[0]);
+            if (state.HasValue && !ExtractionPointScanner.IsIdleLikeState(state))
+            {
+                _scanner.MarkActivated(plan[0]);
             }
         }
 
         private List<Vector3> TryGetAllPlayerPositionsHost()
         {
-            var list = new List<Vector3>();
+            var positions = new List<Vector3>();
 
             try
             {
-                var photonNetworkType = Type.GetType("Photon.Pun.PhotonNetwork, PhotonUnityNetworking");
-                if (photonNetworkType == null) return list;
-
-                var inRoomProp = photonNetworkType.GetProperty("InRoom");
-                var isMasterProp = photonNetworkType.GetProperty("IsMasterClient");
-
-                bool inRoom = inRoomProp != null && inRoomProp.GetValue(null) is bool b1 && b1;
-                bool isMaster = isMasterProp != null && isMasterProp.GetValue(null) is bool b2 && b2;
-
-                if (!inRoom || !isMaster) return list;
-
-                var gdType = Type.GetType("GameDirector, Assembly-CSharp");
-                if (gdType == null) return list;
-
-                object? gdInst = null;
-                var instProp = gdType.GetProperty("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                if (instProp != null) gdInst = instProp.GetValue(null, null);
-                if (gdInst == null)
+                if (!SemiFunc.IsMasterClientOrSingleplayer())
                 {
-                    var instField = gdType.GetField("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                    if (instField != null) gdInst = instField.GetValue(null);
+                    return positions;
                 }
-                if (gdInst == null) return list;
 
-                object? playerListObj = null;
-                var plProp = gdType.GetProperty("PlayerList", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (plProp != null) playerListObj = plProp.GetValue(gdInst, null);
-                if (playerListObj == null)
+                var players = SemiFunc.PlayerGetList();
+                if (players == null || players.Count == 0)
                 {
-                    var plField = gdType.GetField("PlayerList", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (plField != null) playerListObj = plField.GetValue(gdInst);
+                    return positions;
                 }
-                if (playerListObj == null) return list;
 
-                var asEnumerable = playerListObj as System.Collections.IEnumerable;
-                if (asEnumerable == null) return list;
-
-                var temp = new List<Component>();
                 int hash = 17;
-
-                foreach (var p in asEnumerable)
+                var livePlayers = new List<PlayerAvatar>(players.Count);
+                for (int i = 0; i < players.Count; i++)
                 {
-                    if (p == null) continue;
-                    var comp = ExtractPlayerComponent(p);
-                    if (comp == null || comp.transform == null) continue;
+                    var player = players[i];
+                    if (!player || !player.transform)
+                    {
+                        continue;
+                    }
 
-                    temp.Add(comp);
-                    hash = unchecked(hash * 31 + comp.GetInstanceID());
+                    livePlayers.Add(player);
+                    hash = unchecked(hash * 31 + player.GetInstanceID());
                 }
 
-                if (temp.Count == 0) return list;
+                if (livePlayers.Count == 0)
+                {
+                    return positions;
+                }
 
-                bool listChanged = (hash != _playerCacheHash) || (_playerCache.Count != temp.Count);
+                bool listChanged = hash != _playerCacheHash || _playerCache.Count != livePlayers.Count;
                 if (listChanged)
                 {
                     _playerCacheHash = hash;
                     _playerCache.Clear();
-                    _playerCache.AddRange(temp);
+                    _playerCache.AddRange(livePlayers);
                     _playerLastPos.Clear();
                     for (int i = 0; i < _playerCache.Count; i++)
                     {
@@ -518,49 +493,24 @@ namespace REPO_Active
 
                 for (int i = 0; i < _playerCache.Count; i++)
                 {
-                    var comp = _playerCache[i];
-                    if (comp == null || comp.transform == null)
+                    var player = _playerCache[i];
+                    if (!player || !player.transform)
                     {
-                        _playerCache.Clear();
-                        _playerLastPos.Clear();
-                        _playerCacheHash = 0;
-                        return list;
+                        ClearPlayerCache();
+                        return positions;
                     }
 
-                    var pos = comp.transform.position;
-                    list.Add(pos);
-
+                    var pos = player.transform.position;
+                    positions.Add(pos);
                     _playerLastPos[i] = pos;
                 }
             }
             catch
             {
-                return list;
+                return positions;
             }
 
-            return list;
-        }
-
-        private Component? ExtractPlayerComponent(object p)
-        {
-            if (p is Component comp && comp.transform != null) return comp;
-
-            var pt = p.GetType();
-            object? avatarObj = null;
-            var avatarProp = pt.GetProperty("PlayerAvatar", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            if (avatarProp != null) avatarObj = avatarProp.GetValue(p, null);
-            if (avatarObj == null)
-            {
-                var avatarField = pt.GetField("PlayerAvatar", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (avatarField != null) avatarObj = avatarField.GetValue(p);
-            }
-            if (avatarObj == null) return null;
-
-            if (avatarObj is Component comp2 && comp2.transform != null) return comp2;
-
-            var trProp = avatarObj.GetType().GetProperty("transform", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            var tr = trProp != null ? trProp.GetValue(avatarObj, null) as Transform : null;
-            return tr;
+            return positions;
         }
 
         private void UpdateDiscoveredFromCachedPlayers(Vector3 fallbackPos)
@@ -569,52 +519,75 @@ namespace REPO_Active
             {
                 for (int i = 0; i < _playerLastPos.Count; i++)
                 {
-                    _scanner.UpdateDiscovered(_playerLastPos[i], DISCOVER_RADIUS);
+                    _scanner.UpdateDiscovered(_playerLastPos[i], DiscoverRadius);
                 }
+
                 return;
             }
 
-            _scanner.UpdateDiscovered(fallbackPos, DISCOVER_RADIUS);
+            _scanner.UpdateDiscovered(fallbackPos, DiscoverRadius);
         }
 
-        private bool ShouldHoldTailPointActivation(List<Component> allPoints, Vector3 spawnPos, List<Component> plan, Component next, out string reason)
+        private bool ShouldHoldTailPointActivation(
+            List<ExtractionPoint> allPoints,
+            Vector3 spawnPos,
+            List<ExtractionPoint> plan,
+            ExtractionPoint next,
+            out string reason)
         {
             reason = "";
 
-            if (_discoverAllPoints.Value) return false;
-            if (next == null) return false;
-
-            if (!_scanner.TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out var firstAnchor, out var tailAnchor))
+            if (_discoverAllPoints.Value || !next)
+            {
                 return false;
+            }
 
-            if (tailAnchor == null) return false;
+            if (!_scanner.TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out var firstAnchor, out var tailAnchor) ||
+                tailAnchor == null ||
+                !tailAnchor)
+            {
+                return false;
+            }
 
-            int firstId = firstAnchor != null ? firstAnchor.GetInstanceID() : int.MinValue;
+            int firstId = firstAnchor != null && firstAnchor ? firstAnchor.GetInstanceID() : int.MinValue;
             int tailId = tailAnchor.GetInstanceID();
             bool isTailTarget = next.GetInstanceID() == tailId;
 
             var pendingNames = new List<string>();
             for (int i = 0; i < allPoints.Count; i++)
             {
-                var ep = allPoints[i];
-                if (!ep) continue;
-                int id = ep.GetInstanceID();
-                if (id == firstId || id == tailId) continue;
+                var point = allPoints[i];
+                if (!point)
+                {
+                    continue;
+                }
 
-                var st = _scanner.ReadStateName(ep);
-                if (ExtractionPointScanner.IsCompletedLikeState(st)) continue;
+                int id = point.GetInstanceID();
+                if (id == firstId || id == tailId)
+                {
+                    continue;
+                }
 
-                pendingNames.Add($"{ep.gameObject.name}#{ep.GetInstanceID()}({st})");
+                var state = _scanner.ReadState(point);
+                if (ExtractionPointScanner.IsCompletedLikeState(state))
+                {
+                    continue;
+                }
+
+                pendingNames.Add($"{point.gameObject.name}#{point.GetInstanceID()}({_scanner.ReadStateName(point)})");
             }
 
             bool shouldHold = isTailTarget && pendingNames.Count > 0;
-            string queue = plan == null || plan.Count == 0
-                ? "-"
-                : string.Join(" -> ", plan.Where(x => x != null).Select(x => $"{x.gameObject.name}#{x.GetInstanceID()}"));
-
             _lastTailHoldState = shouldHold;
 
-            if (!shouldHold) return false;
+            if (!shouldHold)
+            {
+                return false;
+            }
+
+            string queue = plan.Count == 0
+                ? "-"
+                : string.Join(" -> ", plan.Where(point => point).Select(point => $"{point.gameObject.name}#{point.GetInstanceID()}"));
 
             reason = $"tail point locked, pendingOthers={pendingNames.Count}, pending=[{string.Join(", ", pendingNames)}], queue={queue}";
             return true;
@@ -622,14 +595,16 @@ namespace REPO_Active
 
         private void HandleRoomPopulationChangedEvent(string reason)
         {
-            // Reset interval and player cache when room population changes.
             RefreshDiscoveryIntervalFromCurrentPlayerCount(reason, invalidateCache: true);
         }
 
         private void RefreshDiscoveryIntervalFromCurrentPlayerCount(string reason, bool invalidateCache)
         {
             int players = GetPlayerCountHost();
-            if (players < 1) players = 1;
+            if (players < 1)
+            {
+                players = 1;
+            }
 
             if (players != _lastPlayerCount)
             {
@@ -639,16 +614,23 @@ namespace REPO_Active
 
             if (invalidateCache)
             {
-                _playerCache.Clear();
-                _playerLastPos.Clear();
-                _playerCacheHash = 0;
+                ClearPlayerCache();
             }
         }
+
+        private void ClearPlayerCache()
+        {
+            _playerCache.Clear();
+            _playerLastPos.Clear();
+            _playerCacheHash = 0;
+        }
+
         private float GetDiscoveryInterval()
         {
-            // When all points are treated as discovered, discovery polling does not need
-            // dynamic player-based interval or empty-list penalties.
-            if (_discoverAllPoints.Value) return DISCOVER_INTERVAL_BASE;
+            if (_discoverAllPoints.Value)
+            {
+                return DiscoverIntervalBase;
+            }
 
             if (_lastPlayerCount < 1)
             {
@@ -656,147 +638,89 @@ namespace REPO_Active
             }
 
             float baseInterval = _lastBaseInterval;
-            if (_playerListEmptyStreak <= 0) return baseInterval;
+            if (_playerListEmptyStreak <= 0)
+            {
+                return baseInterval;
+            }
 
-            float mult = 1f + (Math.Min(_playerListEmptyStreak, 10) * 0.2f);
-            float interval = baseInterval * mult;
-            return interval > DISCOVER_INTERVAL_MAX ? DISCOVER_INTERVAL_MAX : interval;
+            float multiplier = 1f + Math.Min(_playerListEmptyStreak, 10) * 0.2f;
+            float interval = baseInterval * multiplier;
+            return interval > DiscoverIntervalMax ? DiscoverIntervalMax : interval;
         }
-        private float ComputeDiscoveryInterval(int players)
+
+        private static float ComputeDiscoveryInterval(int players)
         {
-            if (players <= 3) return DISCOVER_INTERVAL_BASE;
-            if (players <= 6) return DISCOVER_INTERVAL_4_6;
-            if (players <= 9) return DISCOVER_INTERVAL_7_9;
-            return DISCOVER_INTERVAL_10_12;
+            if (players <= 3)
+            {
+                return DiscoverIntervalBase;
+            }
+
+            if (players <= 6)
+            {
+                return DiscoverInterval4To6;
+            }
+
+            if (players <= 9)
+            {
+                return DiscoverInterval7To9;
+            }
+
+            return DiscoverInterval10To12;
         }
 
-        private static void OnPlayerEnteredRoomPostfix()
-        {
-            _instance?.HandleRoomPopulationChangedEvent("player entered");
-        }
-
-        private static void OnPlayerLeftRoomPostfix()
-        {
-            _instance?.HandleRoomPopulationChangedEvent("player left");
-        }
-
-        private void InstallEventPatches()
+        private static int GetPlayerCountHost()
         {
             try
             {
-                _harmony = new Harmony(PluginGuid + ".population");
-                var networkType = AccessTools.TypeByName("NetworkManager");
-                var onEntered = networkType != null ? AccessTools.DeclaredMethod(networkType, "OnPlayerEnteredRoom") : null;
-                if (onEntered != null)
+                if (!SemiFunc.IsMasterClientOrSingleplayer())
                 {
-                    _harmony.Patch(onEntered, postfix: new HarmonyMethod(typeof(Plugin), nameof(OnPlayerEnteredRoomPostfix)));
+                    return 1;
                 }
 
-                var onLeft = networkType != null ? AccessTools.DeclaredMethod(networkType, "OnPlayerLeftRoom") : null;
-                if (onLeft != null)
-                {
-                    _harmony.Patch(onLeft, postfix: new HarmonyMethod(typeof(Plugin), nameof(OnPlayerLeftRoomPostfix)));
-                }
-
+                var players = SemiFunc.PlayerGetList();
+                return players != null && players.Count > 0 ? players.Count : 1;
             }
-            catch (Exception)
+            catch
             {
+                return 1;
             }
         }
 
-        private void UninstallEventPatches()
+        internal static void NotifyRoomPopulationChanged(string reason)
         {
-            try
-            {
-                _harmony?.UnpatchSelf();
-                _harmony = null;
-            }
-            catch { }
+            Instance?.HandleRoomPopulationChangedEvent(reason);
         }
-        private int GetPlayerCountHost()
+
+        internal static void NotifyExtractionPointState(ExtractionPoint point, ExtractionPoint.State state)
         {
-            try
-            {
-                var photonNetworkType = Type.GetType("Photon.Pun.PhotonNetwork, PhotonUnityNetworking");
-                if (photonNetworkType == null) return 1;
-
-                var inRoomProp = photonNetworkType.GetProperty("InRoom");
-                var isMasterProp = photonNetworkType.GetProperty("IsMasterClient");
-                var playerListProp = photonNetworkType.GetProperty("PlayerList");
-
-                bool inRoom = inRoomProp != null && inRoomProp.GetValue(null) is bool b1 && b1;
-                bool isMaster = isMasterProp != null && isMasterProp.GetValue(null) is bool b2 && b2;
-                if (!inRoom || !isMaster) return 1;
-
-                if (playerListProp != null)
-                {
-                    // [VERIFY] PhotonNetwork.PlayerList exists in decompiled PhotonNetwork.cs (returns Player[]).
-                    var arr = playerListProp.GetValue(null) as Array;
-                    if (arr != null && arr.Length > 0) return arr.Length;
-                }
-            }
-            catch { }
-
-            return 1;
+            Instance?.StateTracker.Record(point, state);
         }
+    }
 
+    [HarmonyPatch(typeof(NetworkManager), nameof(NetworkManager.OnPlayerEnteredRoom))]
+    internal static class NetworkManagerOnPlayerEnteredRoomPatch
+    {
+        private static void Postfix()
+        {
+            Plugin.NotifyRoomPopulationChanged("player entered");
+        }
+    }
+
+    [HarmonyPatch(typeof(NetworkManager), nameof(NetworkManager.OnPlayerLeftRoom))]
+    internal static class NetworkManagerOnPlayerLeftRoomPatch
+    {
+        private static void Postfix()
+        {
+            Plugin.NotifyRoomPopulationChanged("player left");
+        }
+    }
+
+    [HarmonyPatch(typeof(ExtractionPoint), nameof(ExtractionPoint.StateSetRPC))]
+    internal static class ExtractionPointStateSetRpcPatch
+    {
+        private static void Postfix(ExtractionPoint __instance, ExtractionPoint.State state)
+        {
+            Plugin.NotifyExtractionPointState(__instance, state);
+        }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

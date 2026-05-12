@@ -4,7 +4,7 @@
     <TargetFramework>netstandard2.1</TargetFramework>
     <LangVersion>latest</LangVersion>
     <AssemblyName>REPO_Active</AssemblyName>
-    <Version>5.1.0</Version>
+    <Version>5.2.1</Version>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
@@ -12,12 +12,35 @@
     <PackageReference Include="BepInEx.Core" Version="5.4.21" />
   </ItemGroup>
 
-  <!-- You need to point UnityManagedPath to: REPO_Data/Managed -->
+  <!-- You can override these with /p:UnityManagedPath=... and /p:BepInExCorePath=... -->
   <PropertyGroup>
-    <UnityManagedPath>C:\Program Files (x86)\Steam\steamapps\common\REPO\REPO_Data\Managed</UnityManagedPath>
+    <UnityManagedPath Condition="'$(UnityManagedPath)' == '' And Exists('D:\SteamLibrary\steamapps\common\REPO\REPO_Data\Managed')">D:\SteamLibrary\steamapps\common\REPO\REPO_Data\Managed</UnityManagedPath>
+    <UnityManagedPath Condition="'$(UnityManagedPath)' == '' And Exists('C:\Program Files (x86)\Steam\steamapps\common\REPO\REPO_Data\Managed')">C:\Program Files (x86)\Steam\steamapps\common\REPO\REPO_Data\Managed</UnityManagedPath>
+    <UnityManagedPath Condition="'$(UnityManagedPath)' == ''">C:\Program Files (x86)\Steam\steamapps\common\REPO\REPO_Data\Managed</UnityManagedPath>
+    <BepInExCorePath Condition="'$(BepInExCorePath)' == '' And Exists('$(APPDATA)\r2modmanPlus-local\REPO\profiles\RP\BepInEx\core')">$(APPDATA)\r2modmanPlus-local\REPO\profiles\RP\BepInEx\core</BepInExCorePath>
   </PropertyGroup>
 
   <ItemGroup>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(UnityManagedPath)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="PhotonUnityNetworking">
+      <HintPath>$(UnityManagedPath)\PhotonUnityNetworking.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="PhotonRealtime">
+      <HintPath>$(UnityManagedPath)\PhotonRealtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Photon3Unity3D">
+      <HintPath>$(UnityManagedPath)\Photon3Unity3D.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony" Condition="'$(BepInExCorePath)' != ''">
+      <HintPath>$(BepInExCorePath)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="UnityEngine">
       <HintPath>$(UnityManagedPath)\UnityEngine.dll</HintPath>
       <Private>false</Private>

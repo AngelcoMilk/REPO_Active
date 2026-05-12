@@ -1,169 +1,164 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using UnityEngine;
+using UnityEngine.AI;
 
 namespace REPO_Active.Runtime
 {
-    public sealed class ExtractionPointScanner
+    internal sealed class ExtractionPointScanner
     {
-        // Verification notes (decompile cross-check):
-        // - ExtractionPoint type and member currentState -> VERIFIED in Assembly-CSharp\ExtractionPoint.cs.
-        // - UnityEngine.Object.FindObjectsOfType(Type) and Time.* are verified in UnityEngine.CoreModule.
-        // - This file does NOT call Photon APIs directly.
-
-        private Type? _epType;
-        private readonly List<Component> _cached = new();
-        private float _lastScanRealtime;
-        private int _lastScanCount = -1;
+        private readonly ExtractionPointStateTracker _stateTracker;
+        private readonly List<ExtractionPoint> _cached = new List<ExtractionPoint>();
+        private readonly HashSet<int> _activatedIds = new HashSet<int>();
+        private readonly HashSet<int> _discovered = new HashSet<int>();
+        private readonly Dictionary<int, float> _spawnPathCache = new Dictionary<int, float>();
+        private readonly HashSet<int> _spawnPathInvalid = new HashSet<int>();
+        private readonly Dictionary<long, float> _edgePathCache = new Dictionary<long, float>();
+        private readonly HashSet<long> _edgePathInvalid = new HashSet<long>();
 
         private Vector3? _spawnPos;
-        private readonly HashSet<int> _activatedIds = new();
-        private readonly HashSet<int> _discovered = new();
-        // Round-level NavMesh path cache (cleared on new round).
-        private readonly Dictionary<int, float> _spawnPathCache = new();
-        private readonly HashSet<int> _spawnPathInvalid = new();
-        private readonly Dictionary<long, float> _edgePathCache = new();
-        private readonly HashSet<long> _edgePathInvalid = new();
+        private float _lastScanRealtime;
+        private int _lastScanCount = -1;
         private int? _firstAnchorId;
         private int? _lastAnchorId;
-        private static readonly Dictionary<string, bool> _idleCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-        private static readonly Dictionary<string, bool> _completeCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-
-        // =====================
-        // Stage1: planning helpers
-        // =====================
 
         public float RescanCooldown { get; set; }
 
         public int CachedCount => _cached.Count;
+
         public int DiscoveredCount => _discovered.Count;
 
-        public ExtractionPointScanner(float rescanCooldown)
+        public ExtractionPointScanner(float rescanCooldown, ExtractionPointStateTracker stateTracker)
         {
             RescanCooldown = rescanCooldown;
-        }
-
-        public bool EnsureReady()
-        {
-            if (_epType != null) return true;
-
-            // [VERIFY] ExtractionPoint type exists in decompiled Assembly-CSharp (ExtractionPoint.cs).
-            _epType = AppDomain.CurrentDomain.GetAssemblies()
-                .SelectMany(a =>
-                {
-                    try { return a.GetTypes(); }
-                    catch { return Array.Empty<Type>(); }
-                })
-                .FirstOrDefault(t => t != null && t.Name == "ExtractionPoint");
-
-            return _epType != null;
+            _stateTracker = stateTracker;
         }
 
         public void ScanIfNeeded(bool force)
         {
             try
             {
-                // [VERIFY] UnityEngine.Time.realtimeSinceStartup (UnityEngine.CoreModule).
-                var t0 = Time.realtimeSinceStartup;
-                var now = t0;
-                if (!force && (now - _lastScanRealtime) < RescanCooldown) return;
+                float now = Time.realtimeSinceStartup;
+                if (!force && now - _lastScanRealtime < RescanCooldown)
+                {
+                    return;
+                }
+
                 _lastScanRealtime = now;
-
-                if (!EnsureReady()) return;
-
-                // [VERIFY] UnityEngine.Object.FindObjectsOfType(Type) (UnityEngine.CoreModule).
-                var found = UnityEngine.Object.FindObjectsOfType(_epType!);
+                var found = UnityEngine.Object.FindObjectsOfType<ExtractionPoint>();
                 _cached.Clear();
-                _cached.AddRange(found.OfType<Component>().Where(c => c != null));
+                _cached.AddRange(found.Where(point => point));
 
-                var dt = Time.realtimeSinceStartup - t0;
                 if (_lastScanCount != _cached.Count)
                 {
                     _lastScanCount = _cached.Count;
                 }
             }
-            catch (Exception)
+            catch
             {
             }
+        }
+
+        public List<ExtractionPoint> ScanAndGetAllPoints()
+        {
+            ScanIfNeeded(force: true);
+            return _cached.Where(point => point).ToList();
         }
 
         public Vector3 GetReferencePos()
         {
-            // [VERIFY] UnityEngine.Camera.main and GameObject.FindWithTag (UnityEngine.CoreModule).
             try
             {
-                if (Camera.main != null) return Camera.main.transform.position;
+                var local = SemiFunc.PlayerAvatarLocal();
+                if (local && local.transform)
+                {
+                    return local.transform.position;
+                }
             }
-            catch { }
+            catch
+            {
+            }
 
             try
             {
-                var p = GameObject.FindWithTag("Player");
-                if (p != null) return p.transform.position;
+                if (Camera.main)
+                {
+                    return Camera.main.transform.position;
+                }
             }
-            catch { }
+            catch
+            {
+            }
+
+            try
+            {
+                var player = GameObject.FindWithTag("Player");
+                if (player)
+                {
+                    return player.transform.position;
+                }
+            }
+            catch
+            {
+            }
 
             return Vector3.zero;
         }
 
-        public void MarkAllDiscovered(List<Component> allPoints)
+        public void MarkAllDiscovered(List<ExtractionPoint> allPoints)
         {
-            int before = _discovered.Count;
             for (int i = 0; i < allPoints.Count; i++)
             {
-                var ep = allPoints[i];
-                if (!ep) continue;
-                _discovered.Add(ep.GetInstanceID());
-            }
-            int added = _discovered.Count - before;
-            if (added > 0)
-            {
+                var point = allPoints[i];
+                if (point)
+                {
+                    _discovered.Add(point.GetInstanceID());
+                }
             }
         }
 
         public void UpdateDiscovered(Vector3 refPos, float radius)
         {
-            UpdateDiscoveredDetailed(refPos, radius, null);
-        }
+            if (_cached.Count == 0)
+            {
+                return;
+            }
 
-        public int UpdateDiscoveredDetailed(Vector3 refPos, float radius, List<Component>? newly)
-        {
-            if (_cached.Count == 0) return 0;
-
-            int before = _discovered.Count;
+            float radiusSquared = radius * radius;
             for (int i = 0; i < _cached.Count; i++)
             {
-                var ep = _cached[i];
-                if (!ep) continue;
-                var id = ep.GetInstanceID();
-                if (_discovered.Contains(id)) continue;
+                var point = _cached[i];
+                if (!point)
+                {
+                    continue;
+                }
 
-                var d2 = (refPos - ep.transform.position).sqrMagnitude;
-                if (d2 <= radius * radius)
+                int id = point.GetInstanceID();
+                if (_discovered.Contains(id))
+                {
+                    continue;
+                }
+
+                if ((refPos - point.transform.position).sqrMagnitude <= radiusSquared)
                 {
                     _discovered.Add(id);
-                    if (newly != null) newly.Add(ep);
                 }
             }
-            int added = _discovered.Count - before;
-            if (added > 0 && newly == null)
-            {
-            }
-            return added;
         }
 
-        public List<Component> FilterDiscovered(List<Component> allPoints)
+        public List<ExtractionPoint> FilterDiscovered(List<ExtractionPoint> allPoints)
         {
-            var list = new List<Component>();
+            var list = new List<ExtractionPoint>();
             for (int i = 0; i < allPoints.Count; i++)
             {
-                var ep = allPoints[i];
-                if (!ep) continue;
-                if (_discovered.Contains(ep.GetInstanceID()))
-                    list.Add(ep);
+                var point = allPoints[i];
+                if (point && _discovered.Contains(point.GetInstanceID()))
+                {
+                    list.Add(point);
+                }
             }
+
             return list;
         }
 
@@ -174,80 +169,66 @@ namespace REPO_Active.Runtime
 
         public void CaptureSpawnPosIfNeeded(Vector3 refPos)
         {
-            if (_spawnPos != null) return;
-            if (refPos == Vector3.zero) return;
+            if (_spawnPos.HasValue || refPos == Vector3.zero)
+            {
+                return;
+            }
+
             _spawnPos = refPos;
         }
 
-        public List<Component> ScanAndGetAllPoints()
-        {
-            ScanIfNeeded(force: true);
-            return _cached.Where(c => c != null).ToList();
-        }
-
         public bool TryGetRoundAnchors(
-            List<Component> allPoints,
+            List<ExtractionPoint> allPoints,
             Vector3 spawnPos,
-            out Component? firstAnchor,
-            out Component? tailAnchor)
+            out ExtractionPoint? firstAnchor,
+            out ExtractionPoint? tailAnchor)
         {
-            // Legacy API retained for compatibility; no longer mutates round anchors.
             return TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out firstAnchor, out tailAnchor);
         }
 
         public bool TryGetGlobalAnchorsNoCache(
-            List<Component> allPoints,
+            List<ExtractionPoint> allPoints,
             Vector3 spawnPos,
-            out Component? firstAnchor,
-            out Component? tailAnchor)
+            out ExtractionPoint? firstAnchor,
+            out ExtractionPoint? tailAnchor)
         {
             firstAnchor = null;
             tailAnchor = null;
-            if (allPoints == null || allPoints.Count == 0) return false;
-            if (spawnPos == Vector3.zero) return false;
-
-            var reachable = new List<(Component ep, int id, float spawnPath)>();
-            for (int i = 0; i < allPoints.Count; i++)
+            if (allPoints == null || allPoints.Count == 0 || spawnPos == Vector3.zero)
             {
-                var ep = allPoints[i];
-                if (!ep) continue;
-                if (!TryGetSpawnPathLength(ep, spawnPos, _spawnPathCache, _spawnPathInvalid, out var d))
-                    continue;
-                reachable.Add((ep, ep.GetInstanceID(), d));
+                return false;
             }
 
-            if (reachable.Count == 0) return false;
-
-            const float tieEpsilon = 0.0001f;
-            (Component ep, int id, float spawnPath) PickByMinSpawn(List<(Component ep, int id, float spawnPath)> list)
+            var reachable = new List<(ExtractionPoint point, int id, float spawnPath)>();
+            for (int i = 0; i < allPoints.Count; i++)
             {
-                var best = list[0];
-                for (int i = 1; i < list.Count; i++)
+                var point = allPoints[i];
+                if (!point)
                 {
-                    var cur = list[i];
-                    if (cur.spawnPath + tieEpsilon < best.spawnPath
-                        || (Mathf.Abs(cur.spawnPath - best.spawnPath) <= tieEpsilon && cur.id < best.id))
-                    {
-                        best = cur;
-                    }
+                    continue;
                 }
-                return best;
+
+                if (TryGetSpawnPathLength(point, spawnPos, _spawnPathCache, _spawnPathInvalid, out var distance))
+                {
+                    reachable.Add((point, point.GetInstanceID(), distance));
+                }
+            }
+
+            if (reachable.Count == 0)
+            {
+                return false;
             }
 
             var firstPick = PickByMinSpawn(reachable);
-            firstAnchor = firstPick.ep;
+            firstAnchor = firstPick.point;
 
-            var rest = new List<(Component ep, int id, float spawnPath)>();
-            for (int i = 0; i < reachable.Count; i++)
+            var rest = reachable.Where(item => item.id != firstPick.id).ToList();
+            if (rest.Count == 0)
             {
-                if (reachable[i].id != firstPick.id)
-                    rest.Add(reachable[i]);
+                return true;
             }
 
-            if (rest.Count == 0) return true;
-
-            var tailPick = PickByMinSpawn(rest);
-            tailAnchor = tailPick.ep;
+            tailAnchor = PickByMinSpawn(rest).point;
             return true;
         }
 
@@ -267,564 +248,402 @@ namespace REPO_Active.Runtime
             _lastScanCount = -1;
         }
 
-        public void MarkActivated(Component ep)
+        public void MarkActivated(ExtractionPoint point)
         {
-            if (ep == null) return;
-            _activatedIds.Add(ep.GetInstanceID());
+            if (point)
+            {
+                _activatedIds.Add(point.GetInstanceID());
+            }
         }
 
-        private bool IsMarkedActivated(Component ep)
+        public ExtractionPoint.State? ReadState(ExtractionPoint point)
         {
-            if (ep == null) return false;
-            return _activatedIds.Contains(ep.GetInstanceID());
+            return _stateTracker.TryGetState(point);
         }
 
-        public bool ReconcileActivatedMarks(List<Component> allPoints)
+        public string ReadStateName(ExtractionPoint point)
         {
-            if (allPoints == null || allPoints.Count == 0)
-            {
-                if (_activatedIds.Count == 0) return false;
-                _activatedIds.Clear();
-                return true;
-            }
-
-            var liveActive = new HashSet<int>();
-            for (int i = 0; i < allPoints.Count; i++)
-            {
-                var ep = allPoints[i];
-                if (!ep) continue;
-                var st = ReadStateName(ep);
-                if (string.IsNullOrEmpty(st)) continue;
-                if (IsIdleLikeState(st)) continue;
-                if (IsCompletedLikeState(st)) continue;
-                liveActive.Add(ep.GetInstanceID());
-            }
-
-            bool changed = false;
-            if (_activatedIds.Count > 0)
-            {
-                var remove = _activatedIds.Where(id => !liveActive.Contains(id)).ToList();
-                if (remove.Count > 0)
-                {
-                    for (int i = 0; i < remove.Count; i++)
-                        _activatedIds.Remove(remove[i]);
-                    changed = true;
-                }
-            }
-
-            foreach (var id in liveActive)
-            {
-                if (_activatedIds.Add(id))
-                    changed = true;
-            }
-
-
-            return changed;
+            return _stateTracker.ReadStateName(point);
         }
 
-        public bool IsAnyExtractionPointActivating(List<Component> allPoints)
-        {
-            string _;
-            int __;
-            return TryGetActivatingInfo(allPoints, out _, out __);
-        }
-
-        public bool TryGetActivatingInfo(List<Component> allPoints, out string info, out int busyCount)
+        public bool TryGetActivatingInfo(List<ExtractionPoint> allPoints, out string info, out int busyCount)
         {
             info = "";
             busyCount = 0;
-            if (allPoints == null || allPoints.Count == 0) return false;
+            if (allPoints == null || allPoints.Count == 0)
+            {
+                return false;
+            }
 
             for (int i = 0; i < allPoints.Count; i++)
             {
-                var ep = allPoints[i];
-                if (!ep) continue;
-
-                try
+                var point = allPoints[i];
+                if (!point)
                 {
-                    var t = ep.GetType();
-                    var f = t.GetField("currentState", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-                    var p = t.GetProperty("currentState", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-                    object? v = null;
-                    if (p != null) v = p.GetValue(ep, null);
-                    if (v == null && f != null) v = f.GetValue(ep);
-                    // [VERIFY] In decompiled ExtractionPoint.cs, `currentState` exists as an internal field (not a property).
-                    if (v == null) continue;
-
-                    var s = v.ToString() ?? "";
-                    if (s.Length == 0) continue;
-
-                    if (IsIdleLikeState(s)) continue;
-                    if (IsCompletedLikeState(s)) continue;
-
-                    busyCount++;
-                    if (string.IsNullOrEmpty(info))
-                        info = $"{ep.gameObject.name} state={s}";
+                    continue;
                 }
-                catch
+
+                var state = ReadState(point);
+                if (!state.HasValue ||
+                    IsIdleLikeState(state) ||
+                    IsCompletedLikeState(state))
                 {
-                    // fail-safe: if can't read, consider it activating
-                    if (busyCount == 0) busyCount = 1;
-                    if (string.IsNullOrEmpty(info)) info = "state read failed";
-                    return true;
+                    continue;
+                }
+
+                busyCount++;
+                if (string.IsNullOrEmpty(info))
+                {
+                    info = $"{point.gameObject.name} state={state.Value}";
                 }
             }
 
             return busyCount > 0;
         }
 
-        internal static bool IsIdleLikeState(string stateName)
+        internal static bool IsIdleLikeState(ExtractionPoint.State? state)
         {
-            if (string.IsNullOrEmpty(stateName)) return false;
-            if (_idleCache.TryGetValue(stateName, out bool cached)) return cached;
-            // [VERIFY] ExtractionPoint.State.Idle exists in decompiled ExtractionPoint.cs enum.
-            bool res = stateName.IndexOf("Idle", StringComparison.OrdinalIgnoreCase) >= 0;
-            _idleCache[stateName] = res;
-            return res;
+            return state == ExtractionPoint.State.None || state == ExtractionPoint.State.Idle;
         }
 
-        internal static bool IsCompletedLikeState(string stateName)
+        internal static bool IsCompletedLikeState(ExtractionPoint.State? state)
         {
-            if (string.IsNullOrEmpty(stateName)) return false;
-            if (_completeCache.TryGetValue(stateName, out bool cached)) return cached;
-            var s = stateName.ToLowerInvariant();
-            // [VERIFY] ExtractionPoint.State.Success / Complete exist in decompiled ExtractionPoint.cs enum.
-            bool res = s.Contains("success")
-                || s.Contains("complete")
-                || s.Contains("submitted")
-                || s.Contains("finish")
-                || s.Contains("done");
-            _completeCache[stateName] = res;
-            return res;
+            return state == ExtractionPoint.State.Success || state == ExtractionPoint.State.Complete;
         }
 
-        public string ReadStateName(Component ep)
-        {
-            if (!ep) return "";
-            try
-            {
-                var t = ep.GetType();
-                var f = t.GetField("currentState", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-                var p = t.GetProperty("currentState", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-                object? v = null;
-                if (p != null) v = p.GetValue(ep, null);
-                if (v == null && f != null) v = f.GetValue(ep);
-                // [VERIFY] In decompiled ExtractionPoint.cs, `currentState` exists as an internal field (not a property).
-                if (v == null) return "";
-                return v.ToString() ?? "";
-            }
-            catch
-            {
-                return "";
-            }
-        }
-
-        /// <summary>
-        /// 闂佸搫顑呯€氼剛绱撻幘璇茬伋婵? 婵＄偑鍊曢幖顐よ姳椤撶偐鏀介柍褜鍓欑叅閻犲洦褰冮悘娆撴偠濞戞牕濡烽柍褜鍓氱换鎰?
-        /// - 闂佹悶鍎遍幖顐︽偩閸撗呯當妞ゆ垼娉曢鍗炩槈閹垮啩鎮嶇紒杈ㄥ缁鎷犻幓鎺撶様闂佹眹鍨婚崰鎾诲磻閿濆洦宕夋い鏍ㄦ皑缁愮偤鏌￠崼姘壕闂佹椿鍙庨崢鎯р枔閹达箑绠甸柟閭﹀墮缁插潡鏌?        /// - 闂佹悶鍎遍幖顐︽偩妤ｅ啫瀚夐柍褜鍓熷畷銉︽償濠靛牜浼囨繛鎴炴惄娴滈妲愭导鏉戞嵍闁靛鍎遍埛鏍归敐鍡欐噮闁稿缍侀弻灞界暆鐎ｎ剛顦紓浣稿€介褔宕甸銏″仺闁绘柨鎼禒顖炴偣娓氼垰鐏犵紒鍓佸仱瀵敻鍩€椤掑嫭鍎?        /// - 婵炴垶鎼╅崣鍐ㄎ涢崸妤佹櫖婵﹩鍓欏鍧楁煙閻戞ê绗掗柛顭戜簽缁岸鎽庨崒姘兼喘闂佹寧绋戦張顒傗偓鍨矒閹瑨銇愰幒鎿勭吹 NavMesh 闁荤姳璀﹂崹鎵閻愬搫绠戝┑鐘崇濮ｆ劙骞栨潏楣冩闁活亙鍗冲鐢稿焵椤掍礁顕?        /// - 闁荤姴鎼悿鍥╂崲閸愵煈鍟呴柟缁樺笧閺嗘岸鏌?閻庡湱顭堝鍓佺紦閸濆娊娲嚒閵堝棛鏆犻梺?        /// - 婵炴垶鎸哥粔铏箾閸ヮ剚鍋ㄩ柕濞у啳绀嬮柣搴ゎ潐濠€鍦礊閸涱垳纾炬い鏇炴缁€澶娾槈閹惧磭小濠电偛娲幃浠嬪Ω瑜庣痪顖滅磼閹规劕鍔电紒鎰〒缁?        /// </summary>
-        public List<Component> BuildStage1PlannedList(
-            List<Component> allPoints,
+        public List<ExtractionPoint> BuildStage1PlannedList(
+            List<ExtractionPoint> allPoints,
             Vector3 spawnPos,
             bool skipActivated)
         {
-            const float tieEpsilon = 0.0001f;
-
-            var t0 = Time.realtimeSinceStartup;
-            var result = new List<Component>();
-            if (allPoints == null || allPoints.Count == 0) return result;
-            if (spawnPos == Vector3.zero)
+            var result = new List<ExtractionPoint>();
+            if (allPoints == null || allPoints.Count == 0 || spawnPos == Vector3.zero)
             {
                 return result;
             }
 
-            var candidates = new List<Component>(allPoints.Count);
-            for (int i = 0; i < allPoints.Count; i++)
+            var candidates = BuildEligibleCandidates(allPoints, skipActivated);
+            if (candidates.Count == 0)
             {
-                var ep = allPoints[i];
-                if (!ep) continue;
-
-                var st = ReadStateName(ep);
-                if (IsCompletedLikeState(st))
-                {
-                    continue;
-                }
-
-                if (skipActivated && IsMarkedActivated(ep))
-                {
-                    continue;
-                }
-
-                candidates.Add(ep);
+                return result;
             }
 
-            if (candidates.Count == 0) return result;
-
-            var reachable = new List<(Component ep, int id, float spawnPath)>();
-            for (int i = 0; i < candidates.Count; i++)
-            {
-                var ep = candidates[i];
-                if (!TryGetSpawnPathLength(ep, spawnPos, _spawnPathCache, _spawnPathInvalid, out var d))
-                    continue;
-                reachable.Add((ep, ep.GetInstanceID(), d));
-            }
-
+            var reachable = GetReachableFromSpawn(candidates, spawnPos);
             if (reachable.Count == 0)
             {
                 return result;
             }
 
-            (Component ep, int id, float spawnPath) PickByMinSpawn(List<(Component ep, int id, float spawnPath)> list)
-            {
-                var best = list[0];
-                for (int i = 1; i < list.Count; i++)
-                {
-                    var cur = list[i];
-                    if (cur.spawnPath + tieEpsilon < best.spawnPath
-                        || (Mathf.Abs(cur.spawnPath - best.spawnPath) <= tieEpsilon && cur.id < best.id))
-                    {
-                        best = cur;
-                    }
-                }
-                return best;
-            }
-
-            int FindIndexById(List<(Component ep, int id, float spawnPath)> list, int id)
-            {
-                for (int i = 0; i < list.Count; i++)
-                {
-                    if (list[i].id == id) return i;
-                }
-                return -1;
-            }
-
-            var firstList = new List<(Component ep, int id, float spawnPath)>(reachable);
-            int firstIdx = -1;
-            if (_firstAnchorId.HasValue)
-                firstIdx = FindIndexById(firstList, _firstAnchorId.Value);
-
-            var firstPick = firstIdx >= 0 ? firstList[firstIdx] : PickByMinSpawn(firstList);
-            var first = firstPick.ep;
-            var firstId = firstPick.id;
-            var firstSpawnPath = firstPick.spawnPath;
+            int firstIndex = FindIndexById(reachable, _firstAnchorId);
+            var firstPick = firstIndex >= 0 ? reachable[firstIndex] : PickByMinSpawn(reachable);
             if (!_firstAnchorId.HasValue)
-                _firstAnchorId = firstId;
-
-            var restForLast = new List<(Component ep, int id, float spawnPath)>();
-            for (int i = 0; i < reachable.Count; i++)
             {
-                if (reachable[i].id != firstId)
-                    restForLast.Add(reachable[i]);
+                _firstAnchorId = firstPick.id;
             }
 
-            result.Add(first);
+            result.Add(firstPick.point);
+
+            var restForLast = reachable.Where(item => item.id != firstPick.id).ToList();
             if (restForLast.Count == 0)
             {
-                {
-                    var dt1 = Time.realtimeSinceStartup - t0;
-                }
                 return result;
             }
 
-            int lastIdx = -1;
-            if (_lastAnchorId.HasValue)
-                lastIdx = FindIndexById(restForLast, _lastAnchorId.Value);
-
-            var lastPick = lastIdx >= 0 ? restForLast[lastIdx] : PickByMinSpawn(restForLast);
-            var last = lastPick.ep;
-            var lastId = lastPick.id;
-            var lastSpawnPath = lastPick.spawnPath;
+            int lastIndex = FindIndexById(restForLast, _lastAnchorId);
+            var lastPick = lastIndex >= 0 ? restForLast[lastIndex] : PickByMinSpawn(restForLast);
             if (!_lastAnchorId.HasValue)
-                _lastAnchorId = lastId;
-
-            var middleCandidates = new List<Component>();
-            for (int i = 0; i < restForLast.Count; i++)
             {
-                if (restForLast[i].id != lastId)
-                    middleCandidates.Add(restForLast[i].ep);
+                _lastAnchorId = lastPick.id;
             }
 
-            List<Component>? bestMiddle = null;
-            float bestTotal = float.MaxValue;
+            var middle = restForLast
+                .Where(item => item.id != lastPick.id)
+                .Select(item => item.point)
+                .ToList();
 
-            bool IsBetterSameCostOrder(List<Component> current, List<Component>? best)
+            var orderedMiddle = FindBestMiddleOrder(firstPick.point, middle, lastPick.point);
+            if (orderedMiddle == null)
             {
-                if (best == null) return true;
-                int n = Math.Min(current.Count, best.Count);
-                for (int i = 0; i < n; i++)
-                {
-                    int a = current[i].GetInstanceID();
-                    int b = best[i].GetInstanceID();
-                    if (a != b) return a < b;
-                }
-                return current.Count < best.Count;
+                return new List<ExtractionPoint>();
             }
 
-            if (middleCandidates.Count == 0)
-            {
-                if (TryGetEdgePathLength(first, last, _edgePathCache, _edgePathInvalid, out var directFl))
-                {
-                    bestTotal = directFl;
-                    bestMiddle = new List<Component>();
-                }
-            }
-            else
-            {
-                var used = new bool[middleCandidates.Count];
-                var curOrder = new List<Component>(middleCandidates.Count);
-
-                void Dfs(Component prev, float costSoFar)
-                {
-                    if (costSoFar > bestTotal + tieEpsilon) return;
-
-                    if (curOrder.Count == middleCandidates.Count)
-                    {
-                        if (!TryGetEdgePathLength(prev, last, _edgePathCache, _edgePathInvalid, out var tailCost))
-                            return;
-
-                        var total = costSoFar + tailCost;
-                        if (total + tieEpsilon < bestTotal
-                            || (Mathf.Abs(total - bestTotal) <= tieEpsilon && IsBetterSameCostOrder(curOrder, bestMiddle)))
-                        {
-                            bestTotal = total;
-                            bestMiddle = new List<Component>(curOrder);
-                        }
-                        return;
-                    }
-
-                    for (int i = 0; i < middleCandidates.Count; i++)
-                    {
-                        if (used[i]) continue;
-                        var next = middleCandidates[i];
-
-                        if (!TryGetEdgePathLength(prev, next, _edgePathCache, _edgePathInvalid, out var edgeCost))
-                            continue;
-
-                        used[i] = true;
-                        curOrder.Add(next);
-                        Dfs(next, costSoFar + edgeCost);
-                        curOrder.RemoveAt(curOrder.Count - 1);
-                        used[i] = false;
-                    }
-                }
-
-                Dfs(first, 0f);
-            }
-
-            if (bestMiddle == null)
-            {
-                return new List<Component>();
-            }
-
-            for (int i = 0; i < bestMiddle.Count; i++)
-                result.Add(bestMiddle[i]);
-            result.Add(last);
-
-            var dt = Time.realtimeSinceStartup - t0;
-            {
-            }
+            result.AddRange(orderedMiddle);
+            result.Add(lastPick.point);
             return result;
         }
 
-        public List<Component> BuildPlanDiscoverAllFixedAnchors(
-            List<Component> allPoints,
+        public List<ExtractionPoint> BuildPlanDiscoverAllFixedAnchors(
+            List<ExtractionPoint> allPoints,
             Vector3 spawnPos,
             bool skipActivated)
         {
-            const float tieEpsilon = 0.0001f;
-
-            var t0 = Time.realtimeSinceStartup;
-            var result = new List<Component>();
-            if (allPoints == null || allPoints.Count == 0) return result;
-            if (spawnPos == Vector3.zero)
+            var result = new List<ExtractionPoint>();
+            if (allPoints == null || allPoints.Count == 0 || spawnPos == Vector3.zero)
             {
                 return result;
             }
 
-            if (!TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out var globalFirst, out var globalTail) || globalFirst == null)
+            if (!TryGetGlobalAnchorsNoCache(allPoints, spawnPos, out var globalFirst, out var globalTail) ||
+                globalFirst == null ||
+                !globalFirst)
             {
                 return result;
             }
 
-            var candidates = new List<Component>(allPoints.Count);
-            for (int i = 0; i < allPoints.Count; i++)
+            var candidates = BuildEligibleCandidates(allPoints, skipActivated);
+            if (candidates.Count == 0)
             {
-                var ep = allPoints[i];
-                if (!ep) continue;
-
-                var st = ReadStateName(ep);
-                if (IsCompletedLikeState(st))
-                {
-                    continue;
-                }
-
-                if (skipActivated && IsMarkedActivated(ep))
-                {
-                    continue;
-                }
-
-                candidates.Add(ep);
+                return result;
             }
 
-            if (candidates.Count == 0) return result;
-
-            var reachable = new List<(Component ep, int id, float spawnPath)>();
-            for (int i = 0; i < candidates.Count; i++)
-            {
-                var ep = candidates[i];
-                if (!TryGetSpawnPathLength(ep, spawnPos, _spawnPathCache, _spawnPathInvalid, out var d))
-                    continue;
-                reachable.Add((ep, ep.GetInstanceID(), d));
-            }
-
+            var reachable = GetReachableFromSpawn(candidates, spawnPos);
             if (reachable.Count == 0)
             {
                 return result;
-            }
-
-            (Component ep, int id, float spawnPath) PickByMinSpawn(List<(Component ep, int id, float spawnPath)> list)
-            {
-                var best = list[0];
-                for (int i = 1; i < list.Count; i++)
-                {
-                    var cur = list[i];
-                    if (cur.spawnPath + tieEpsilon < best.spawnPath
-                        || (Mathf.Abs(cur.spawnPath - best.spawnPath) <= tieEpsilon && cur.id < best.id))
-                    {
-                        best = cur;
-                    }
-                }
-                return best;
             }
 
             int globalFirstId = globalFirst.GetInstanceID();
-            int globalTailId = globalTail != null ? globalTail.GetInstanceID() : int.MinValue;
+            int globalTailId = globalTail != null && globalTail ? globalTail.GetInstanceID() : int.MinValue;
 
-            bool hasGlobalFirst = reachable.Any(x => x.id == globalFirstId);
-            bool hasGlobalTail = globalTail != null && globalTailId != globalFirstId && reachable.Any(x => x.id == globalTailId);
+            bool hasGlobalFirst = reachable.Any(item => item.id == globalFirstId);
+            bool hasGlobalTail = globalTail != null && globalTail && globalTailId != globalFirstId && reachable.Any(item => item.id == globalTailId);
 
-            (Component ep, int id, float spawnPath)? firstEntry = null;
+            (ExtractionPoint point, int id, float spawnPath) firstEntry;
             if (hasGlobalFirst)
             {
-                firstEntry = reachable.First(x => x.id == globalFirstId);
+                firstEntry = reachable.First(item => item.id == globalFirstId);
             }
             else
             {
-                var pool = hasGlobalTail
-                    ? reachable.Where(x => x.id != globalTailId).ToList()
+                var firstPool = hasGlobalTail
+                    ? reachable.Where(item => item.id != globalTailId).ToList()
                     : reachable;
-                if (pool.Count == 0) pool = reachable;
-                firstEntry = PickByMinSpawn(pool);
-            }
-
-            var first = firstEntry.Value.ep;
-            int firstId = firstEntry.Value.id;
-            result.Add(first);
-
-            bool tailUsable = hasGlobalTail && globalTailId != firstId;
-            var middleCandidates = new List<Component>();
-            for (int i = 0; i < reachable.Count; i++)
-            {
-                var cur = reachable[i];
-                if (cur.id == firstId) continue;
-                if (tailUsable && cur.id == globalTailId) continue;
-                middleCandidates.Add(cur.ep);
-            }
-
-            Component? tail = tailUsable ? reachable.First(x => x.id == globalTailId).ep : null;
-
-            List<Component>? bestMiddle = null;
-            float bestTotal = float.MaxValue;
-
-            bool IsBetterSameCostOrder(List<Component> current, List<Component>? best)
-            {
-                if (best == null) return true;
-                int n = Math.Min(current.Count, best.Count);
-                for (int i = 0; i < n; i++)
+                if (firstPool.Count == 0)
                 {
-                    int a = current[i].GetInstanceID();
-                    int b = best[i].GetInstanceID();
-                    if (a != b) return a < b;
+                    firstPool = reachable;
                 }
-                return current.Count < best.Count;
+
+                firstEntry = PickByMinSpawn(firstPool);
+            }
+
+            result.Add(firstEntry.point);
+
+            bool tailUsable = hasGlobalTail && globalTailId != firstEntry.id;
+            ExtractionPoint? tail = tailUsable ? reachable.First(item => item.id == globalTailId).point : null;
+            var middle = reachable
+                .Where(item => item.id != firstEntry.id)
+                .Where(item => !tailUsable || item.id != globalTailId)
+                .Select(item => item.point)
+                .ToList();
+
+            var orderedMiddle = FindBestMiddleOrder(firstEntry.point, middle, tail);
+            if (orderedMiddle == null)
+            {
+                return new List<ExtractionPoint>();
+            }
+
+            result.AddRange(orderedMiddle);
+            if (tail != null && tail)
+            {
+                result.Add(tail);
+            }
+
+            return result;
+        }
+
+        private List<ExtractionPoint> BuildEligibleCandidates(List<ExtractionPoint> allPoints, bool skipActivated)
+        {
+            var candidates = new List<ExtractionPoint>(allPoints.Count);
+            for (int i = 0; i < allPoints.Count; i++)
+            {
+                var point = allPoints[i];
+                if (!point)
+                {
+                    continue;
+                }
+
+                if (IsCompletedLikeState(ReadState(point)))
+                {
+                    continue;
+                }
+
+                if (skipActivated && IsMarkedActivated(point))
+                {
+                    continue;
+                }
+
+                candidates.Add(point);
+            }
+
+            return candidates;
+        }
+
+        private bool IsMarkedActivated(ExtractionPoint point)
+        {
+            return point && _activatedIds.Contains(point.GetInstanceID());
+        }
+
+        private List<(ExtractionPoint point, int id, float spawnPath)> GetReachableFromSpawn(
+            List<ExtractionPoint> candidates,
+            Vector3 spawnPos)
+        {
+            var reachable = new List<(ExtractionPoint point, int id, float spawnPath)>();
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                var point = candidates[i];
+                if (!point)
+                {
+                    continue;
+                }
+
+                if (TryGetSpawnPathLength(point, spawnPos, _spawnPathCache, _spawnPathInvalid, out var distance))
+                {
+                    reachable.Add((point, point.GetInstanceID(), distance));
+                }
+            }
+
+            return reachable;
+        }
+
+        private List<ExtractionPoint>? FindBestMiddleOrder(
+            ExtractionPoint first,
+            List<ExtractionPoint> middleCandidates,
+            ExtractionPoint? tail)
+        {
+            if (!first)
+            {
+                return null;
             }
 
             if (middleCandidates.Count == 0)
             {
-                if (tail == null)
+                if (tail == null || !tail)
                 {
-                    bestTotal = 0f;
-                    bestMiddle = new List<Component>();
+                    return new List<ExtractionPoint>();
                 }
-                else if (TryGetEdgePathLength(first, tail, _edgePathCache, _edgePathInvalid, out var directFl))
-                {
-                    bestTotal = directFl;
-                    bestMiddle = new List<Component>();
-                }
+
+                return TryGetEdgePathLength(first, tail, _edgePathCache, _edgePathInvalid, out _)
+                    ? new List<ExtractionPoint>()
+                    : null;
             }
-            else
+
+            const float tieEpsilon = 0.0001f;
+            var used = new bool[middleCandidates.Count];
+            var current = new List<ExtractionPoint>(middleCandidates.Count);
+            List<ExtractionPoint>? best = null;
+            float bestTotal = float.MaxValue;
+
+            void Search(ExtractionPoint previous, float costSoFar)
             {
-                var used = new bool[middleCandidates.Count];
-                var curOrder = new List<Component>(middleCandidates.Count);
-
-                void Dfs(Component prev, float costSoFar)
+                if (costSoFar > bestTotal + tieEpsilon)
                 {
-                    if (costSoFar > bestTotal + tieEpsilon) return;
+                    return;
+                }
 
-                    if (curOrder.Count == middleCandidates.Count)
+                if (current.Count == middleCandidates.Count)
+                {
+                    float total = costSoFar;
+                if (tail != null && tail)
                     {
-                        float total = costSoFar;
-                        if (tail != null)
+                        if (!TryGetEdgePathLength(previous, tail, _edgePathCache, _edgePathInvalid, out var tailCost))
                         {
-                            if (!TryGetEdgePathLength(prev, tail, _edgePathCache, _edgePathInvalid, out var tailCost))
-                                return;
-                            total += tailCost;
+                            return;
                         }
 
-                        if (total + tieEpsilon < bestTotal
-                            || (Mathf.Abs(total - bestTotal) <= tieEpsilon && IsBetterSameCostOrder(curOrder, bestMiddle)))
-                        {
-                            bestTotal = total;
-                            bestMiddle = new List<Component>(curOrder);
-                        }
-                        return;
+                        total += tailCost;
                     }
 
-                    for (int i = 0; i < middleCandidates.Count; i++)
+                    if (total + tieEpsilon < bestTotal ||
+                        Mathf.Abs(total - bestTotal) <= tieEpsilon && IsBetterSameCostOrder(current, best))
                     {
-                        if (used[i]) continue;
-                        var next = middleCandidates[i];
-
-                        if (!TryGetEdgePathLength(prev, next, _edgePathCache, _edgePathInvalid, out var edgeCost))
-                            continue;
-
-                        used[i] = true;
-                        curOrder.Add(next);
-                        Dfs(next, costSoFar + edgeCost);
-                        curOrder.RemoveAt(curOrder.Count - 1);
-                        used[i] = false;
+                        bestTotal = total;
+                        best = new List<ExtractionPoint>(current);
                     }
+
+                    return;
                 }
 
-                Dfs(first, 0f);
+                for (int i = 0; i < middleCandidates.Count; i++)
+                {
+                    if (used[i])
+                    {
+                        continue;
+                    }
+
+                    var next = middleCandidates[i];
+                    if (!next ||
+                        !TryGetEdgePathLength(previous, next, _edgePathCache, _edgePathInvalid, out var edgeCost))
+                    {
+                        continue;
+                    }
+
+                    used[i] = true;
+                    current.Add(next);
+                    Search(next, costSoFar + edgeCost);
+                    current.RemoveAt(current.Count - 1);
+                    used[i] = false;
+                }
             }
 
-            if (bestMiddle == null)
+            Search(first, 0f);
+            return best;
+        }
+
+        private static bool IsBetterSameCostOrder(List<ExtractionPoint> current, List<ExtractionPoint>? best)
+        {
+            if (best == null)
             {
-                return new List<Component>();
+                return true;
             }
 
-            for (int i = 0; i < bestMiddle.Count; i++)
-                result.Add(bestMiddle[i]);
-            if (tail != null)
-                result.Add(tail);
-
+            int count = Math.Min(current.Count, best.Count);
+            for (int i = 0; i < count; i++)
             {
-                var ordered = string.Join(" -> ", result.Where(x => x != null).Select(x => x.gameObject.name));
-                var tailName = tail != null ? tail.gameObject.name : "none";
-                var dt = Time.realtimeSinceStartup - t0;
+                int a = current[i].GetInstanceID();
+                int b = best[i].GetInstanceID();
+                if (a != b)
+                {
+                    return a < b;
+                }
             }
 
-            return result;
+            return current.Count < best.Count;
+        }
+
+        private static (ExtractionPoint point, int id, float spawnPath) PickByMinSpawn(
+            List<(ExtractionPoint point, int id, float spawnPath)> list)
+        {
+            const float tieEpsilon = 0.0001f;
+            var best = list[0];
+            for (int i = 1; i < list.Count; i++)
+            {
+                var current = list[i];
+                if (current.spawnPath + tieEpsilon < best.spawnPath ||
+                    Mathf.Abs(current.spawnPath - best.spawnPath) <= tieEpsilon && current.id < best.id)
+                {
+                    best = current;
+                }
+            }
+
+            return best;
+        }
+
+        private static int FindIndexById(List<(ExtractionPoint point, int id, float spawnPath)> list, int? id)
+        {
+            if (!id.HasValue)
+            {
+                return -1;
+            }
+
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i].id == id.Value)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
         }
 
         private static long MakeDirectedKey(int fromId, int toId)
@@ -837,19 +656,25 @@ namespace REPO_Active.Runtime
             length = 0f;
             try
             {
-                // Some map points are slightly off NavMesh; sample both ends first to avoid false unreachable.
-                if (!TrySampleNavPoint(from, out var fromOnNav)) return false;
-                if (!TrySampleNavPoint(to, out var toOnNav)) return false;
+                if (!TrySampleNavPoint(from, out var fromOnNav) ||
+                    !TrySampleNavPoint(to, out var toOnNav))
+                {
+                    return false;
+                }
 
-                var path = new UnityEngine.AI.NavMeshPath();
-                if (!UnityEngine.AI.NavMesh.CalculatePath(fromOnNav, toOnNav, UnityEngine.AI.NavMesh.AllAreas, path))
+                var path = new NavMeshPath();
+                if (!NavMesh.CalculatePath(fromOnNav, toOnNav, NavMesh.AllAreas, path) ||
+                    path.status != NavMeshPathStatus.PathComplete)
+                {
                     return false;
-                if (path.status != UnityEngine.AI.NavMeshPathStatus.PathComplete)
-                    return false;
+                }
 
                 var corners = path.corners;
                 if (corners == null || corners.Length == 0)
+                {
                     return false;
+                }
+
                 if (corners.Length == 1)
                 {
                     length = 0f;
@@ -874,16 +699,14 @@ namespace REPO_Active.Runtime
         private static bool TrySampleNavPoint(Vector3 pos, out Vector3 sampled)
         {
             sampled = pos;
-            UnityEngine.AI.NavMeshHit hit;
 
-            // Fast near sample, then broader fallback for uneven terrain / spawn offsets.
-            if (UnityEngine.AI.NavMesh.SamplePosition(pos, out hit, 3f, UnityEngine.AI.NavMesh.AllAreas))
+            if (NavMesh.SamplePosition(pos, out var hit, 3f, NavMesh.AllAreas))
             {
                 sampled = hit.position;
                 return true;
             }
 
-            if (UnityEngine.AI.NavMesh.SamplePosition(pos, out hit, 10f, UnityEngine.AI.NavMesh.AllAreas))
+            if (NavMesh.SamplePosition(pos, out hit, 10f, NavMesh.AllAreas))
             {
                 sampled = hit.position;
                 return true;
@@ -893,20 +716,30 @@ namespace REPO_Active.Runtime
         }
 
         private bool TryGetSpawnPathLength(
-            Component ep,
+            ExtractionPoint point,
             Vector3 spawnPos,
             Dictionary<int, float> cache,
             HashSet<int> invalid,
             out float length)
         {
             length = 0f;
-            if (!ep) return false;
+            if (!point)
+            {
+                return false;
+            }
 
-            int id = ep.GetInstanceID();
-            if (cache.TryGetValue(id, out length)) return true;
-            if (invalid.Contains(id)) return false;
+            int id = point.GetInstanceID();
+            if (cache.TryGetValue(id, out length))
+            {
+                return true;
+            }
 
-            if (TryGetPathLength(spawnPos, ep.transform.position, out length))
+            if (invalid.Contains(id))
+            {
+                return false;
+            }
+
+            if (TryGetPathLength(spawnPos, point.transform.position, out length))
             {
                 cache[id] = length;
                 return true;
@@ -917,14 +750,17 @@ namespace REPO_Active.Runtime
         }
 
         private bool TryGetEdgePathLength(
-            Component from,
-            Component to,
+            ExtractionPoint from,
+            ExtractionPoint to,
             Dictionary<long, float> cache,
             HashSet<long> invalid,
             out float length)
         {
             length = 0f;
-            if (!from || !to) return false;
+            if (!from || !to)
+            {
+                return false;
+            }
 
             int fromId = from.GetInstanceID();
             int toId = to.GetInstanceID();
@@ -935,8 +771,15 @@ namespace REPO_Active.Runtime
             }
 
             long key = MakeDirectedKey(fromId, toId);
-            if (cache.TryGetValue(key, out length)) return true;
-            if (invalid.Contains(key)) return false;
+            if (cache.TryGetValue(key, out length))
+            {
+                return true;
+            }
+
+            if (invalid.Contains(key))
+            {
+                return false;
+            }
 
             if (TryGetPathLength(from.transform.position, to.transform.position, out length))
             {
@@ -947,18 +790,5 @@ namespace REPO_Active.Runtime
             invalid.Add(key);
             return false;
         }
-
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-

@@ -1,6 +1,6 @@
 # REPO_Active 技术说明（当前版本）
 
-适用版本：`5.1.0`
+适用版本：`5.2.1`
 源码根目录：`C:\Users\Home\Documents\GitHub\REPO_Active`
 
 ## 1. 目标与边界
@@ -20,12 +20,12 @@
 关键文件：
 - `src/REPO_Active/Plugin.cs`
 - `src/REPO_Active/Runtime/ExtractionPointScanner.cs`
-- `src/REPO_Active/Reflection/ExtractionPointInvoker.cs`
+- `src/REPO_Active/Runtime/ExtractionPointStateTracker.cs`
 
 职责划分：
 - `Plugin.cs`：配置读取、生命周期、轮询驱动、激活流程编排。
 - `ExtractionPointScanner.cs`：提取点扫描、状态读取、发现集合维护、路径规划、激活态检测。
-- `ExtractionPointInvoker.cs`：反射调用 `OnClick()`。
+- `ExtractionPointStateTracker.cs`：通过 `ExtractionPoint.StateSetRPC` patch 追踪状态；仅在缺少初始状态时集中读取一次 `currentState` 作为兼容 fallback。
 
 ## 3. 配置项（当前）
 
@@ -109,7 +109,7 @@
 
 ## 6. 状态判定标准
 
-状态读取：`currentState`（反射字段/属性兜底）。
+状态读取：优先由 `ExtractionPoint.StateSetRPC` 的 Harmony Postfix 记录 `ExtractionPoint.State`；`currentState` 只作为初始状态缺失时的集中 fallback。
 
 - Idle-like：名称包含 `Idle`。
 - Completed-like：名称包含以下任一关键字（忽略大小写）：
@@ -161,7 +161,7 @@
 
 ## 9. 已知风险点
 
-- 游戏更新若改动 `ExtractionPoint` 类型名、`OnClick` 签名或 `currentState`，会导致反射失效。
+- 游戏更新若改动 `ExtractionPoint` 类型名、`OnClick` 签名或 `StateSetRPC` 签名，会导致强类型引用或 patch 失效。
 - 状态字符串命名若变更，会影响 Idle/Complete 判定。
 - NavMesh 在个别地图上若出现不可达边，可能导致候选路径被过滤，进而改变排序结果。
 - 发现模式下，进局初期数据时序异常时仍可能出现短暂“已发现不足”，30s 缓冲已用于降低该风险。
